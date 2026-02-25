@@ -1,0 +1,167 @@
+# =============================================================================
+# docker-compose.yml — Projeto CMML
+# =============================================================================
+# Todos os secrets via variáveis de ambiente (.env).
+# Copie .env.example para .env e preencha antes de subir.
+# =============================================================================
+
+services:
+
+  # ── SQL Server (ERP source) ───────────────────────────────────────────────
+  sqlserver_gp:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlserver_gp
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${MSSQL_PASSWORD}"
+      MSSQL_PID: Developer
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+      - ./docker/sqlserver/backup:/var/opt/mssql/backup:ro
+    networks:
+      - backend-net
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/opt/mssql-tools18/bin/sqlcmd",
+          "-S", "localhost",
+          "-U", "sa",
+          "-P", "${MSSQL_PASSWORD}",
+          "-Q", "SELECT 1",
+          "-No",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ── PostgreSQL (destination) ──────────────────────────────────────────────
+  reco-postgres:
+    image: pgvector/pgvector:pg16
+    container_name: reco-postgres
+    environment:
+      POSTGRES_DB: "${PG_DB}"
+      POSTGRES_USER: "${PG_USER}"
+      POSTGRES_PASSWORD: "${PG_PASSWORD}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── FastAPI (API) ─────────────────────────────────────────────────────────
+  reco-api:
+    build:
+      context: ./app/api
+      dockerfile: Dockerfile
+    container_name: reco-api
+    # Nginx configs reference upstream as "api", so we add a network alias
+    networks:
+      backend-net:
+        aliases:
+          - api
+      frontend-net:
+        aliases:
+          - api
+    ports:
+      - "${API_PORT:-8001}:8001"
+    environment:
+      PG_HOST: reco-postgres
+      PG_PORT: "5432"
+      PG_DB: "${PG_DB}"
+      PG_USER: "${PG_USER}"
+      PG_PASSWORD: "${PG_PASSWORD}"
+    depends_on:
+      reco-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8001/docs\")'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── Dashboard ML (React + Nginx) ─────────────────────────────────────────
+  reco-dashboard:
+    build:
+      context: ./app/dashboard
+      dockerfile: Dockerfile
+    container_name: reco-dashboard
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    networks:
+      - frontend-net
+    depends_on:
+      reco-api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Business 360 (React + Nginx) ─────────────────────────────────────────
+  reco-business:
+    build:
+      context: ./app/business
+      dockerfile: Dockerfile
+    container_name: reco-business
+    ports:
+      - "${BUSINESS_PORT:-3001}:3001"
+    networks:
+      - frontend-net
+    depends_on:
+      reco-api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── pgAdmin (dev only) ───────────────────────────────────────────────────
+  reco-pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: reco-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: "${PGADMIN_DEFAULT_EMAIL}"
+      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_DEFAULT_PASSWORD}"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    networks:
+      - backend-net
+    depends_on:
+      reco-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/misc/ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# ── Networks ────────────────────────────────────────────────────────────────
+networks:
+  backend-net:
+    driver: bridge
+  frontend-net:
+    driver: bridge
+
+# ── Volumes ─────────────────────────────────────────────────────────────────
+volumes:
+  sqlserver_data:
+  postgres_data:

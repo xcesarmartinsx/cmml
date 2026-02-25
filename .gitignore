@@ -1,0 +1,64 @@
+# =============================================================
+# .gitignore — Projeto CMML
+# =============================================================
+
+# ---- Segredos e configurações locais ----
+.env
+*.env.local
+*.env.prod
+
+# ---- Backups de banco de dados (arquivos grandes e sensíveis) ----
+*.BAK
+*.bak
+*.MDF
+*.LDF
+*.dump
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.cover
+
+# ---- Jupyter Notebooks ----
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- Modelos treinados (artefatos grandes) ----
+*.lgb
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+app/ml/models/**/*.lgb
+app/ml/models/**/*.pkl
+
+# ---- IDEs ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Docker ----
+docker/sqlserver/backup/

@@ -1,0 +1,63 @@
+# =============================================================================
+# Security Scan — Projeto CMML
+# =============================================================================
+# Executa pip-audit nos requirements.txt do projeto.
+# Roda em push para main e em PRs.
+# =============================================================================
+
+name: Security
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - "**"
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # -- pip-audit (Python dependencies) ----------------------------------------
+  pip-audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit app/api/requirements.txt
+        run: pip-audit -r app/api/requirements.txt --desc
+
+  # -- npm audit (frontend dependencies) --------------------------------------
+  npm-audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [dashboard, business]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Audit app/${{ matrix.app }}
+        working-directory: app/${{ matrix.app }}
+        run: |
+          npm install --package-lock-only --ignore-scripts 2>/dev/null || true
+          npm audit --audit-level=high || {
+            echo "::warning::npm audit found high/critical vulnerabilities in app/${{ matrix.app }}"
+            exit 1
+          }
