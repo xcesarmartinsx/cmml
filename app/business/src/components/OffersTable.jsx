@@ -10,6 +10,7 @@
  */
 import { useState, useEffect } from 'react'
 import { apiFetch } from '../api.js'
+import CustomerPurchaseModal from './CustomerPurchaseModal.jsx'
 
 const PAGE_SIZE = 50
 
@@ -66,13 +67,15 @@ export default function OffersTable() {
   const [page,         setPage]         = useState(1)
   const [loading,      setLoading]      = useState(true)
   const [batchInfo,    setBatchInfo]    = useState(null)
+  const [sortDir,      setSortDir]      = useState(null) // null | 'desc' | 'asc'
+  const [selectedCustomer, setSelectedCustomer] = useState(null) // { id, name } | null
+  const [exporting,        setExporting]        = useState(false)
 
   // Carrega lista de batches disponíveis
   useEffect(() => {
     apiFetch('/api/recommendations/batches')
       .then(r => r.json())
       .then(d => {
-        setBatches(d)
         if (d.length > 0) setBatchInfo(d[0])
       })
       .catch(() => {})
@@ -90,6 +93,32 @@ export default function OffersTable() {
       .catch(() => setLoading(false))
   }, [strategy])
 
+  async function handleExport() {
+    setExporting(true)
+    try {
+      const params = new URLSearchParams()
+      if (strategy) params.set('strategy', strategy)
+      const resp = await apiFetch(`/api/recommendations/offers/export?${params}`)
+      if (!resp.ok) throw new Error('Falha na exportação')
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      // Pega o nome do arquivo do header Content-Disposition, ou usa padrão
+      const disposition = resp.headers.get('Content-Disposition') || ''
+      const match = disposition.match(/filename="?([^"]+)"?/)
+      a.download = match ? match[1] : `ofertas_${new Date().toISOString().slice(0,10)}.csv`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      console.error('Erro ao exportar:', e)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   // Volta para página 1 quando qualquer filtro muda
   useEffect(() => { setPage(1) }, [strategy, minScore, lastPurchase])
 
@@ -105,6 +134,16 @@ export default function OffersTable() {
     (lastPurchase === '' ||
       (lastPurchase === 'yes' ? row.last_purchase_date !== null : row.last_purchase_date === null))
   )
+
+  // Ordenação por % Chance
+  if (sortDir) {
+    filtered.sort((a, b) => {
+      const va = a.score_pct ?? 0
+      const vb = b.score_pct ?? 0
+      return sortDir === 'desc' ? vb - va : va - vb
+    })
+  }
+
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const safePage   = Math.min(page, totalPages)
   const paged      = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
@@ -197,6 +236,31 @@ export default function OffersTable() {
             </select>
           </div>
 
+          {/* Exportar CSV */}
+          <button
+            onClick={handleExport}
+            disabled={exporting || loading}
+            title="Exportar toda a lista como CSV"
+            style={{
+              display:      'inline-flex',
+              alignItems:   'center',
+              gap:          6,
+              padding:      '4px 14px',
+              fontSize:     12,
+              fontWeight:   600,
+              borderRadius: 6,
+              border:       '1px solid var(--border)',
+              background:   exporting ? 'var(--surface)' : 'var(--purple)',
+              color:        exporting ? 'var(--muted)' : '#fff',
+              cursor:       exporting || loading ? 'not-allowed' : 'pointer',
+              opacity:      exporting || loading ? 0.7 : 1,
+              whiteSpace:   'nowrap',
+              transition:   'opacity 0.2s',
+            }}
+          >
+            {exporting ? 'Exportando…' : '↓ Exportar CSV'}
+          </button>
+
         </div>
       </div>
 
@@ -215,7 +279,19 @@ export default function OffersTable() {
                 <th style={{ width: 32 }}>#</th>
                 <th>Cliente</th>
                 <th>Produto</th>
-                <th style={{ textAlign: 'center' }}>% Chance</th>
+                <th
+                  style={{ textAlign: 'center', cursor: 'pointer', userSelect: 'none' }}
+                  onClick={() => {
+                    setSortDir(prev => prev === null ? 'desc' : prev === 'desc' ? 'asc' : null)
+                    setPage(1)
+                  }}
+                  title="Clique para ordenar por probabilidade"
+                >
+                  % Chance{' '}
+                  <span style={{ fontSize: 10, opacity: sortDir ? 1 : 0.3 }}>
+                    {sortDir === 'asc' ? '\u2191' : sortDir === 'desc' ? '\u2193' : '\u2195'}
+                  </span>
+                </th>
                 <th>Última Compra</th>
                 <th>Contato</th>
                 <th>Modelo</th>
@@ -232,11 +308,27 @@ export default function OffersTable() {
                     </span>
                   </td>
 
-                  {/* Cliente */}
+                  {/* Cliente — clicável para abrir timeline de compras */}
                   <td style={{ maxWidth: 200 }}>
-                    <span style={{ fontSize: 13, fontWeight: 500 }}>
+                    <button
+                      onClick={() => setSelectedCustomer({ id: row.customer_id, name: row.customer_name })}
+                      title="Ver histórico de compras"
+                      style={{
+                        background:      'none',
+                        border:          'none',
+                        padding:         0,
+                        cursor:          'pointer',
+                        fontSize:        13,
+                        fontWeight:      500,
+                        color:           'var(--purple)',
+                        textDecoration:  'underline',
+                        textDecorationStyle: 'dotted',
+                        textUnderlineOffset: '3px',
+                        textAlign:       'left',
+                      }}
+                    >
                       {row.customer_name || '—'}
-                    </span>
+                    </button>
                   </td>
 
                   {/* Produto */}
@@ -377,6 +469,15 @@ export default function OffersTable() {
           </span>
 
         </div>
+      )}
+
+      {/* Modal de timeline de compras */}
+      {selectedCustomer && (
+        <CustomerPurchaseModal
+          customerId={selectedCustomer.id}
+          customerName={selectedCustomer.name}
+          onClose={() => setSelectedCustomer(null)}
+        />
       )}
     </div>
   )

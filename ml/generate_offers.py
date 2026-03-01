@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 
 # ── Resolução do path ──────────────────────────────────────────────────────────
@@ -56,6 +57,142 @@ LOG = setup_logging("ml.generate_offers")
 
 # Validade padrão das ofertas geradas: 30 dias
 OFFER_EXPIRY_DAYS = 30
+
+
+# ===========================================================================
+# LIFECYCLE-AWARE SCORE ADJUSTMENT
+# ===========================================================================
+
+def load_lifecycle_data(pg) -> pd.DataFrame:
+    """
+    Carrega dados de ciclo de vida de reco.product_lifecycle (materialized view).
+
+    Retorna DataFrame com product_id, avg_days_between_purchases, lifecycle_tier, sample_size.
+    """
+    query = """
+        SELECT product_id, avg_days_between_purchases, median_days_between_purchases,
+               lifecycle_tier, sample_size, distinct_customers
+        FROM reco.product_lifecycle
+    """
+    try:
+        df = pd.read_sql(query, pg)
+        LOG.info(f"Lifecycle data loaded: {len(df):,} products")
+        return df
+    except Exception as exc:
+        LOG.warning(f"Could not load reco.product_lifecycle: {exc}. Skipping lifecycle adjustment.")
+        return pd.DataFrame()
+
+
+def load_last_purchase_per_customer_product(pg) -> pd.DataFrame:
+    """
+    Carrega a data da ultima compra de cada par (cliente, produto).
+    Usado para calcular dias desde a ultima compra e aplicar desconto de ciclo de vida.
+    """
+    query = """
+        SELECT customer_id, product_id, MAX(sale_date) AS last_purchase_date
+        FROM cur.order_items
+        GROUP BY customer_id, product_id
+    """
+    df = pd.read_sql(query, pg)
+    df["last_purchase_date"] = pd.to_datetime(df["last_purchase_date"])
+    return df
+
+
+def apply_lifecycle_discount(
+    reco_df: pd.DataFrame,
+    lifecycle_df: pd.DataFrame,
+    last_purchase_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Aplica desconto no score baseado no ciclo de vida do produto.
+
+    Logica:
+    - Se o cliente comprou o produto recentemente E o produto tem ciclo de vida longo,
+      o score e penalizado proporcionalmente.
+    - lifecycle_ratio = days_since_last_purchase / avg_lifecycle_days
+    - Se lifecycle_ratio < 1.0 (comprou recentemente relativo ao ciclo), aplica desconto.
+    - Desconto = score * sigmoid(lifecycle_ratio) onde sigmoid satura em ~1.0 para ratio >= 1.5.
+    - Produtos sem dados de lifecycle ou sem compra anterior: sem desconto.
+
+    Parametros
+    ----------
+    reco_df          : DataFrame com colunas [customer_id, product_id, score, ...]
+    lifecycle_df     : DataFrame com colunas [product_id, avg_days_between_purchases, sample_size, ...]
+    last_purchase_df : DataFrame com colunas [customer_id, product_id, last_purchase_date]
+    """
+    if lifecycle_df.empty:
+        LOG.info("No lifecycle data available. Skipping discount.")
+        return reco_df
+
+    today = pd.Timestamp.now()
+
+    # Merge lifecycle data
+    df = reco_df.merge(
+        lifecycle_df[["product_id", "avg_days_between_purchases", "sample_size"]],
+        on="product_id",
+        how="left",
+    )
+
+    # Merge last purchase date per (customer, product) pair
+    df = df.merge(
+        last_purchase_df,
+        on=["customer_id", "product_id"],
+        how="left",
+    )
+
+    # Calculate days since last purchase
+    df["days_since_last"] = (today - df["last_purchase_date"]).dt.days
+
+    # Calculate lifecycle ratio: how much of the lifecycle has elapsed
+    # ratio < 1.0 = purchased recently relative to lifecycle
+    # ratio >= 1.0 = due or overdue for repurchase
+    df["lifecycle_ratio"] = np.where(
+        (df["avg_days_between_purchases"].notna()) &
+        (df["avg_days_between_purchases"] > 0) &
+        (df["days_since_last"].notna()),
+        df["days_since_last"] / df["avg_days_between_purchases"],
+        np.nan,  # no data => no discount
+    )
+
+    # Discount factor using a sigmoid-like curve:
+    # - ratio >= 1.0 => factor ~1.0 (no penalty, client is due for repurchase)
+    # - ratio = 0.5 => factor ~0.5 (50% penalty, bought halfway through cycle)
+    # - ratio = 0.0 => factor ~0.2 (80% penalty, just bought)
+    # Formula: factor = 1 / (1 + exp(-5 * (ratio - 0.7)))
+    # Adjusted so penalty kicks in strongly when ratio < 0.7 (30% before due date)
+    has_lifecycle = df["lifecycle_ratio"].notna()
+    discount_factor = np.ones(len(df))
+    if has_lifecycle.any():
+        ratio = df.loc[has_lifecycle, "lifecycle_ratio"].values
+        discount_factor[has_lifecycle] = 1.0 / (1.0 + np.exp(-5.0 * (ratio - 0.7)))
+
+    original_score = df["score"].copy()
+    df["score_original"] = original_score
+    df["score"] = original_score * discount_factor
+    df["lifecycle_discount"] = discount_factor
+
+    # Log statistics
+    discounted = (discount_factor < 0.95) & has_lifecycle.values
+    if discounted.any():
+        avg_discount = 1.0 - discount_factor[discounted].mean()
+        LOG.info(
+            f"Lifecycle discount applied to {discounted.sum():,} offers "
+            f"(avg penalty: {avg_discount*100:.1f}%)"
+        )
+    else:
+        LOG.info("Lifecycle discount: no offers penalized (all clients are due for repurchase).")
+
+    # Re-rank within each (customer_id, strategy) group based on adjusted score
+    df = df.sort_values(["customer_id", "strategy", "score"], ascending=[True, True, False])
+    df["rank"] = df.groupby(["customer_id", "strategy"]).cumcount() + 1
+
+    # Drop auxiliary columns
+    df = df.drop(columns=[
+        "avg_days_between_purchases", "sample_size", "last_purchase_date",
+        "days_since_last", "lifecycle_ratio", "score_original", "lifecycle_discount",
+    ])
+
+    return df
 
 
 # ===========================================================================
@@ -176,6 +313,12 @@ def main(strategy: str = "both", top_n: int = 10, dry_run: bool = False) -> None
 
         df_all = pd.concat(frames, ignore_index=True)
         LOG.info(f"Total de ofertas geradas: {len(df_all):,} ({df_all['customer_id'].nunique():,} clientes únicos)")
+
+        # Apply lifecycle-aware score discount
+        lifecycle_df = load_lifecycle_data(pg)
+        if not lifecycle_df.empty:
+            last_purchase_df = load_last_purchase_per_customer_product(pg)
+            df_all = apply_lifecycle_discount(df_all, lifecycle_df, last_purchase_df)
 
         if dry_run:
             LOG.info("[DRY RUN] Sem gravação no banco. Amostra:")

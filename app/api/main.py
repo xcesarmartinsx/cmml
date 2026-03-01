@@ -1,10 +1,8 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query, Depends, Request
+from fastapi import FastAPI, Query, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import psycopg2.extras
 import os
@@ -17,11 +15,7 @@ from routers.recommendations import router as recommendations_router
 # Importa o router de autenticacao JWT
 from routers.auth import router as auth_router
 # Importa dependencias compartilhadas
-from deps import get_current_user, init_pool, close_pool, get_db, release_db
-
-# ── Rate Limiter ─────────────────────────────────────────────────────────────
-_default_rate = os.getenv("RATE_LIMIT_DEFAULT", "60/minute")
-limiter = Limiter(key_func=get_remote_address, default_limits=[_default_rate])
+from deps import get_current_user, init_pool, close_pool, get_db, release_db, limiter, _default_rate
 
 
 # ── Lifespan (startup/shutdown) ──────────────────────────────────────────────
@@ -60,6 +54,16 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response: Response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
 # Registra o router de autenticacao (publico)
 app.include_router(auth_router)
 # Registra as rotas de negocio (/api/business/*) — protegidas por JWT
@@ -90,6 +94,7 @@ def get_evaluation_runs(
     request: Request,
     strategy: Optional[str] = Query(None),
     k: Optional[int] = Query(None),
+    _user: str = Depends(get_current_user),
 ):
     conn = get_db()
     try:
@@ -116,7 +121,7 @@ def get_evaluation_runs(
 
 @app.get("/api/models/latest")
 @limiter.limit(_default_rate)
-def get_models_latest(request: Request):
+def get_models_latest(request: Request, _user: str = Depends(get_current_user)):
     """Latest evaluation run per strategy (all K values grouped)."""
     conn = get_db()
     try:
@@ -135,7 +140,7 @@ def get_models_latest(request: Request):
 
 @app.get("/api/strategies")
 @limiter.limit(_default_rate)
-def get_strategies(request: Request):
+def get_strategies(request: Request, _user: str = Depends(get_current_user)):
     conn = get_db()
     try:
         with conn.cursor() as cur:
@@ -149,7 +154,7 @@ def get_strategies(request: Request):
 
 @app.get("/api/k-values")
 @limiter.limit(_default_rate)
-def get_k_values(request: Request):
+def get_k_values(request: Request, _user: str = Depends(get_current_user)):
     conn = get_db()
     try:
         with conn.cursor() as cur:

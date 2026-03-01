@@ -177,10 +177,57 @@ MSSQL_ETL_PASSWORD=<senha_definida>
 
 ---
 
+## Autenticação JWT (Implementado)
+
+Sistema de autenticação temporária implementado em `app/api/routers/auth.py` e `app/api/deps.py`.
+
+| Aspecto | Detalhe |
+|---|---|
+| Algoritmo | HS256 (HMAC-SHA256) |
+| Hash de senha | bcrypt via `passlib` |
+| Expiração do token | 480 min (8h), configurável via `JWT_EXPIRE_MINUTES` |
+| Endpoint | `POST /api/auth/token` — retorna `{access_token, token_type}` |
+| Rate limit (login) | 5/minuto por IP (configurável via `RATE_LIMIT_LOGIN`) |
+| Mensagem de erro | Genérica — não revela se usuário existe ou senha está errada |
+
+### Endpoints protegidos por JWT
+
+Todos os endpoints requerem `Authorization: Bearer <token>`:
+
+| Prefixo | Router |
+|---|---|
+| `/api/business/*` | `routers/business.py` |
+| `/api/recommendations/*` | `routers/recommendations.py` |
+| `/api/evaluation-runs` | `main.py` |
+| `/api/models/latest` | `main.py` |
+| `/api/strategies` | `main.py` |
+| `/api/k-values` | `main.py` |
+
+Único endpoint público: `POST /api/auth/token`.
+
+---
+
+## Headers de Segurança HTTP (Implementado)
+
+Middleware em `app/api/main.py` adiciona automaticamente a todas as respostas:
+
+| Header | Valor |
+|---|---|
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `X-XSS-Protection` | `1; mode=block` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+
+---
+
 ## Próximos Passos
 
 1. ~~Criar `.gitignore` e remover `.env` do rastreamento Git.~~ (Implementado)
 2. Mover o backup `.BAK` para storage externo seguro.
 3. ~~Criar usuários de banco com privilégios mínimos.~~ (Implementado — `sql/ddl/00_users_pg.sql` e `sql/ddl/00_users_mssql.sql`)
-4. Consultar jurídico sobre base legal para processamento dos dados (consentimento ou legítimo interesse).
-5. Definir política de retenção e rotina de expurgo de dados antigos.
+4. ~~Autenticação JWT em todos os endpoints.~~ (Implementado)
+5. ~~Headers de segurança HTTP.~~ (Implementado)
+6. ~~Rate limiting no login (brute-force protection).~~ (Implementado — 5/min por IP)
+7. Consultar jurídico sobre base legal para processamento dos dados (consentimento ou legítimo interesse).
+8. Definir política de retenção e rotina de expurgo de dados antigos.
+9. Implementar autenticação multi-usuário com RBAC (atualmente: admin único via env var).

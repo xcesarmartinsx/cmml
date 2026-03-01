@@ -21,10 +21,11 @@ MONTAGEM
 """
 
 # ── Biblioteca padrao ──────────────────────────────────────────────────────────
+import os
 from typing import Optional
 
 # ── FastAPI ────────────────────────────────────────────────────────────────────
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 # ── Psycopg2 ──────────────────────────────────────────────────────────────────
 import psycopg2.extras
@@ -862,5 +863,72 @@ def get_etl_status():
             if r.get("finished_at"):
                 r["finished_at"] = r["finished_at"].isoformat()
         return rows
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/business/customers/{customer_id}/purchase-history
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/api/business/customers/{customer_id}/purchase-history")
+def get_purchase_history(customer_id: int):
+    """
+    Retorna o histórico completo de compras de um cliente, ordenado por data
+    decrescente (compra mais recente primeiro).
+
+    Retorna 404 se o customer_id não existir em cur.customers.
+    """
+    conn = _get_db()
+    try:
+        # Verifica existência e obtém nome do cliente (stg.customers, chave customer_id_src)
+        customer_row = _rows(
+            conn,
+            """
+            SELECT customer_id_src AS customer_id, name
+            FROM stg.customers
+            WHERE customer_id_src = %s
+              AND source_system = 'sqlserver_gp'
+            LIMIT 1
+            """,
+            (customer_id,),
+        )
+        if not customer_row:
+            raise HTTPException(status_code=404, detail=f"Cliente {customer_id} não encontrado.")
+
+        customer_name = customer_row[0]["name"]
+
+        # Histórico completo de compras ordenado por data desc
+        # cur.order_items não tem unit_price — calculado como total_value / quantity
+        purchases = _rows(
+            conn,
+            """
+            SELECT
+                oi.sale_date::TEXT                                  AS sale_date,
+                oi.order_id_src                                     AS order_id,
+                p.description                                       AS product_name,
+                oi.quantity::FLOAT                                  AS quantity,
+                CASE
+                    WHEN oi.quantity > 0
+                    THEN ROUND((oi.total_value / oi.quantity)::numeric, 2)::FLOAT
+                    ELSE NULL
+                END                                                 AS unit_price,
+                oi.total_value::FLOAT                               AS total_value
+            FROM cur.order_items oi
+            JOIN cur.products p
+              ON p.product_id    = oi.product_id
+             AND p.source_system = oi.source_system
+            WHERE oi.customer_id = %s
+            ORDER BY oi.sale_date DESC, oi.order_id_src
+            """,
+            (customer_id,),
+        )
+
+        return {
+            "customer_id"     : customer_id,
+            "customer_name"   : customer_name,
+            "total_purchases" : len(purchases),
+            "purchases"       : purchases,
+        }
     finally:
         conn.close()

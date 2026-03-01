@@ -6,16 +6,21 @@ Router FastAPI para o dashboard de ofertas.
 Endpoints:
   GET /api/recommendations/batches           — lista todos os batches com resumo
   GET /api/recommendations/offers            — ofertas do batch mais recente (ou específico)
+  GET /api/recommendations/offers/export     — exporta ofertas em CSV (sem paginação, PII mascarada)
   GET /api/recommendations/summary           — KPIs + funil de scores do batch atual
   GET /api/recommendations/product-lifecycle — Top 50 produtos com ciclo de vida e estatísticas
 """
 
+import csv
+import io
 import os
+from datetime import date
 from typing import Optional
 
 import psycopg2
 import psycopg2.extras
 from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 
@@ -178,6 +183,149 @@ def get_offers(
                     row["last_purchase_date"] = row["last_purchase_date"].isoformat()
                 result.append(row)
             return result
+    finally:
+        conn.close()
+
+
+def _mask_phone(raw: str | None) -> str:
+    """
+    Mascara o número de telefone para exportação CSV, preservando apenas os
+    últimos 4 dígitos. Exigência LGPD — nunca exportar o número completo.
+
+    Exemplos:
+      "(11) 91234-5678"  ->  "(**) *****-5678"
+      None / ""          ->  ""
+    """
+    if not raw or not raw.strip():
+        return ""
+    digits = "".join(c for c in raw if c.isdigit())
+    if len(digits) < 6:
+        return ""
+    return f"(**) *****-{digits[-4:]}"
+
+
+@router.get("/api/recommendations/offers/export")
+def export_offers(
+    batch_id: Optional[str] = Query(None, description="UUID do batch; padrão: mais recente"),
+    strategy: Optional[str] = Query(None, description="Filtrar por estratégia: 'modelo_a_ranker' ou 'modelo_b_colaborativo'"),
+):
+    """
+    Exporta todas as ofertas do batch especificado (ou do mais recente) em CSV.
+
+    Retorna StreamingResponse com media_type='text/csv'.
+    O telefone é mascarado (LGPD): apenas os 4 últimos dígitos são exibidos.
+    O endpoint herda a autenticação JWT exigida pelo router em main.py.
+    """
+    conn = _get_db()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Determina o batch_id alvo
+            if batch_id is None:
+                cur.execute("""
+                    SELECT offer_batch_id::text
+                    FROM reco.offers
+                    ORDER BY generated_at DESC
+                    LIMIT 1
+                """)
+                row = cur.fetchone()
+                if row is None:
+                    # Retorna CSV vazio com cabeçalho
+                    buf = io.StringIO()
+                    writer = csv.writer(buf)
+                    writer.writerow(["#", "cliente", "produto", "chance_pct", "modelo", "ultima_compra", "contato", "gerado_em"])
+                    buf.seek(0)
+                    filename = f"ofertas_{date.today().isoformat()}.csv"
+                    return StreamingResponse(
+                        iter([buf.read()]),
+                        media_type="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+                    )
+                batch_id = row["offer_batch_id"]
+
+            params = [batch_id]
+            strategy_filter = ""
+            if strategy:
+                strategy_filter = "AND o.strategy = %s"
+                params.append(strategy)
+
+            query = f"""
+                SELECT
+                    o.offer_id,
+                    o.rank,
+                    sc.name                                   AS customer_name,
+                    NULLIF(
+                        CASE
+                            WHEN LENGTH(REGEXP_REPLACE(COALESCE(sc.mobile, sc.phone), '[^0-9]', '', 'g')) >= 6
+                            THEN COALESCE(sc.mobile, sc.phone)
+                            ELSE NULL
+                        END,
+                    '') AS contact,
+                    cp.description                            AS product_name,
+                    o.strategy,
+                    ROUND((o.score * 100)::numeric, 0)::int  AS score_pct,
+                    o.generated_at,
+                    lp.last_purchase_date
+                FROM reco.offers o
+                JOIN stg.customers sc
+                    ON sc.customer_id_src = o.customer_id
+                   AND sc.source_system   = 'sqlserver_gp'
+                JOIN cur.products cp
+                    ON cp.product_id    = o.product_id
+                   AND cp.source_system = 'sqlserver_gp'
+                LEFT JOIN (
+                    SELECT customer_id, product_id, MAX(sale_date) AS last_purchase_date
+                    FROM cur.order_items
+                    GROUP BY customer_id, product_id
+                ) lp ON lp.customer_id = o.customer_id
+                     AND lp.product_id  = o.product_id
+                WHERE o.offer_batch_id = %s::uuid
+                  {strategy_filter}
+                ORDER BY o.rank ASC
+            """
+            cur.execute(query, params)
+            rows = cur.fetchall()
+
+        # Monta o CSV em memória e faz streaming
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["#", "cliente", "produto", "chance_pct", "modelo", "ultima_compra", "contato", "gerado_em"])
+
+        strategy_labels = {
+            "modelo_a_ranker":       "Modelo A",
+            "modelo_b_colaborativo": "Modelo B",
+        }
+
+        for rank_global, r in enumerate(rows, start=1):
+            row = dict(r)
+
+            last_purchase = ""
+            if row.get("last_purchase_date"):
+                d = row["last_purchase_date"]
+                last_purchase = d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
+
+            generated_at = ""
+            if row.get("generated_at"):
+                g = row["generated_at"]
+                generated_at = g.strftime("%d/%m/%Y %H:%M") if hasattr(g, "strftime") else str(g)
+
+            writer.writerow([
+                rank_global,
+                row.get("customer_name") or "",
+                row.get("product_name") or "",
+                int(row["score_pct"]) if row.get("score_pct") is not None else 0,
+                strategy_labels.get(row.get("strategy", ""), row.get("strategy", "")),
+                last_purchase,
+                _mask_phone(row.get("contact")),
+                generated_at,
+            ])
+
+        buf.seek(0)
+        filename = f"ofertas_{date.today().isoformat()}.csv"
+        return StreamingResponse(
+            iter([buf.read()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+        )
     finally:
         conn.close()
 

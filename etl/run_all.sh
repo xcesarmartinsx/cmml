@@ -241,6 +241,21 @@ ORDER BY started_at DESC;
 " 2>&1 | tee -a "$LOG_FILE"
 
 # ---------------------------------------------------------------------------
+# Refresh da materialized view de ciclo de vida de produtos
+# ---------------------------------------------------------------------------
+
+log_msg "Atualizando reco.product_lifecycle (ciclo de vida de produtos)..."
+PGPASSWORD="$PG_PASSWORD" psql \
+    -h "$PG_HOST" \
+    -p "$PG_PORT" \
+    -U "$PG_USER" \
+    -d "$PG_DB" \
+    --no-password \
+    -c "REFRESH MATERIALIZED VIEW CONCURRENTLY reco.product_lifecycle;" \
+    2>&1 | tee -a "$LOG_FILE"
+log_msg "✓ reco.product_lifecycle atualizada"
+
+# ---------------------------------------------------------------------------
 # Rodapé do run
 # ---------------------------------------------------------------------------
 

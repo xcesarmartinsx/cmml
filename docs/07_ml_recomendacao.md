@@ -299,6 +299,45 @@ def recall_at_k(recommended, relevant, k):
 
 ---
 
+## Ciclo de Vida de Produtos (Product Lifecycle)
+
+### Problema
+
+Produtos de longa vida util (redes, travesseiros, cobertores) apareciam com scores altos
+mesmo para clientes que os compraram recentemente. Exemplo: REDE ESPECIAL MISS CEARA
+com 99.6% de probabilidade para um cliente que ja comprou nos ultimos meses.
+
+### Solucao
+
+1. **Materialized View `reco.product_lifecycle`**: calcula o intervalo medio e mediano
+   entre recompras por produto, classificando em tiers (short <90d, medium 90-365d, long >365d).
+   DDL em `sql/ddl/04_product_lifecycle.sql`.
+
+2. **Feature `lifecycle_ratio`** (Modelo A): `days_since_last_purchase / avg_repurchase_days`.
+   Valores < 1.0 indicam compra recente relativa ao ciclo do produto.
+
+3. **Feature `lifecycle_too_soon`** (Modelo A): flag binaria quando `lifecycle_ratio < 0.5`.
+   Sinal explicito para o LightGBM penalizar recomendacoes prematuras.
+
+4. **Desconto pos-hoc** (`generate_offers.py`): aplica funcao sigmoide ao score baseada
+   no lifecycle_ratio. Clientes que compraram recentemente produtos de longo ciclo recebem
+   penalidade de ate 80% no score. Funciona para ambos Modelo A e Modelo B.
+
+### Distribuicao dos Tiers
+
+| Tier   | Produtos | Ciclo Medio |
+|--------|----------|-------------|
+| short  | 2104     | 35 dias     |
+| medium | 1896     | 193 dias    |
+| long   | 682      | 676 dias    |
+
+### Refresh
+
+Apos novo ETL, executar: `make lifecycle-refresh` ou
+`REFRESH MATERIALIZED VIEW CONCURRENTLY reco.product_lifecycle;`
+
+---
+
 ## Roadmap: Feedback Loop e WhatsApp
 
 > Estas funcionalidades estão **fora do escopo do MVP** e devem ser implementadas em fases futuras.

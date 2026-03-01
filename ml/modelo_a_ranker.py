@@ -49,6 +49,10 @@ FEATURES USADAS
     - afinidade por categoria (% de compras nessa categoria)
     - frequência de compra do produto pelo cliente
 
+  Ciclo de Vida (Par × Produto):
+    - lifecycle_ratio: days_since_last_purchase / avg_repurchase_days
+    - lifecycle_too_soon: flag binária se lifecycle_ratio < 0.5 (compra prematura)
+
 USO
   # Treinar e salvar modelo:
   python ml/modelo_a_ranker.py
@@ -599,6 +603,15 @@ def build_training_dataset(
         0.0,
     )
 
+    # lifecycle_too_soon: flag binária indicando que o cliente comprou recentemente
+    # relativo ao ciclo médio do produto (ratio < 0.5 = menos da metade do ciclo).
+    # Ajuda o modelo a aprender a penalizar recomendações prematuras de forma explícita.
+    dataset["lifecycle_too_soon"] = np.where(
+        (dataset["bought_before"] > 0) & (dataset["lifecycle_ratio"] > 0),
+        (dataset["lifecycle_ratio"] < 0.5).astype(float),
+        0.0,
+    )
+
     # Separa features (X) e labels (y)
     y = dataset["label"].values.astype(int)
     X = dataset.drop(columns=["label", "customer_id", "product_id"])
@@ -753,6 +766,7 @@ def generate_recommendations(
     product_feats  = build_product_features(df_history, reference_date)
 
     results = []
+    rng = np.random.default_rng(seed=42)
 
     for cid in customer_ids:
         # Produtos que o cliente comprou nos últimos 30 dias (janela de recompra)
@@ -771,7 +785,7 @@ def generate_recommendations(
             continue
 
         n_sample = min(n_candidates, len(candidates))
-        sampled_candidates = np.random.choice(candidates, size=n_sample, replace=False)
+        sampled_candidates = rng.choice(candidates, size=n_sample, replace=False)
 
         # Monta features para os candidatos
         candidate_pairs = pd.DataFrame({
@@ -798,6 +812,13 @@ def generate_recommendations(
         X_inf["lifecycle_ratio"] = np.where(
             (X_inf["bought_before"] > 0) & (X_inf["product_avg_repurchase_days"] > 0),
             X_inf["days_since_last_product_purchase"] / X_inf["product_avg_repurchase_days"],
+            0.0,
+        )
+
+        # lifecycle_too_soon — mesma fórmula usada no treino
+        X_inf["lifecycle_too_soon"] = np.where(
+            (X_inf["bought_before"] > 0) & (X_inf["lifecycle_ratio"] > 0),
+            (X_inf["lifecycle_ratio"] < 0.5).astype(float),
             0.0,
         )
 

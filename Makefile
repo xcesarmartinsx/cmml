@@ -3,7 +3,7 @@
 # [Proposto] — comandos operacionais principais
 # =============================================================
 
-.PHONY: help up down logs restart psql etl-sales etl-customers etl-products etl-stores etl reco baseline test clean status
+.PHONY: help up down logs restart psql etl-sales etl-customers etl-products etl-stores etl reco baseline test clean status lifecycle-refresh
 
 # Carrega variáveis do .env para uso no make
 include .env
@@ -68,6 +68,9 @@ ddl:
 	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/01_staging.sql
 	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/02_curated.sql
 	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/03_reco.sql
+
+lifecycle-refresh:
+	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -c "REFRESH MATERIALIZED VIEW CONCURRENTLY reco.product_lifecycle;"
 
 # --- ETL ---
 etl-stores:

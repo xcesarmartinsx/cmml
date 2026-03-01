@@ -16,10 +16,12 @@ Credenciais de admin configuradas via variáveis de ambiente:
 import os
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from jose import jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
+
+from deps import limiter
 
 router = APIRouter()
 
@@ -92,13 +94,18 @@ def create_access_token(subject: str) -> str:
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
+_login_rate = os.getenv("RATE_LIMIT_LOGIN", "5/minute")
+
+
 @router.post("/api/auth/token", response_model=TokenResponse)
-def login(body: TokenRequest):
+@limiter.limit(_login_rate)
+def login(request: Request, body: TokenRequest):
     """
     Autentica o usuário e retorna um token JWT.
 
     Retorna 401 com mensagem genérica se credenciais inválidas
     (não revela se o usuário existe ou se a senha está errada).
+    Rate limit: 5 tentativas/minuto por IP (configurável via RATE_LIMIT_LOGIN).
     """
     if not _authenticate_user(body.username, body.password):
         raise HTTPException(

@@ -14,8 +14,14 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from psycopg2.pool import ThreadedConnectionPool
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 logger = logging.getLogger(__name__)
+
+# ── Rate Limiter (compartilhado entre main.py e routers) ─────────────────────
+_default_rate = os.getenv("RATE_LIMIT_DEFAULT", "60/minute")
+limiter = Limiter(key_func=get_remote_address, default_limits=[_default_rate])
 
 # ── Connection Pool ──────────────────────────────────────────────────────────
 # Inicializado em init_pool() chamado pelo lifespan do app.
