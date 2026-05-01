@@ -27,6 +27,7 @@ const METRIC_LABELS = {
   recall_at_k: 'Recall@K',
   ndcg_at_k: 'NDCG@K',
   map_at_k: 'MAP@K',
+  auc_roc: 'AUC-ROC',
 }
 
 function CustomTooltip({ active, payload, label }) {
@@ -47,9 +48,13 @@ function CustomTooltip({ active, payload, label }) {
 
 export default function MetricsChart({ runs, strategies, metric, k }) {
   const metricLabel = METRIC_LABELS[metric] || metric
+  const isGlobalMetric = metric === 'auc_roc'
 
-  // Filter to selected K and build time series
-  const kRuns = runs.filter((r) => r.k === k)
+  // AUC-ROC is a global metric (not per-K), so use runs filtered by K but read auc_roc field
+  // For @K metrics, filter to selected K as before
+  const kRuns = isGlobalMetric
+    ? runs.filter((r) => r.k === k)
+    : runs.filter((r) => r.k === k)
 
   if (kRuns.length === 0) {
     return (
@@ -71,20 +76,23 @@ export default function MetricsChart({ runs, strategies, metric, k }) {
     }
     for (const s of strategies) {
       const run = kRuns.find((r) => r.evaluated_at === ts && r.strategy === s)
-      if (run) point[s] = run[metric]
+      if (run) {
+        const val = run[metric]
+        if (val != null) point[s] = val
+      }
     }
     return point
   })
 
   // Only show points where at least one strategy has data
   const validData = chartData.filter((d) =>
-    strategies.some((s) => d[s] !== undefined)
+    strategies.some((s) => d[s] != null)
   )
 
   return (
     <div>
       <p className="chart-subtitle">
-        Evolução de <strong>{metricLabel}</strong> ao longo das avaliações (K={k})
+        Evolução de <strong>{metricLabel}</strong> ao longo das avaliações{isGlobalMetric ? '' : ` (K=${k})`}
       </p>
       <ResponsiveContainer width="100%" height={360}>
         <LineChart

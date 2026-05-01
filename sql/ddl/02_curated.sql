@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS reco.offers (
     product_id           BIGINT       NOT NULL,
     -- Modelo que gerou a recomendação: 'modelo_a_ranker' ou 'modelo_b_colaborativo'.
     strategy             TEXT         NOT NULL,
-    -- Probabilidade de compra prevista pelo modelo (0–1).
+    -- Score de relevância previsto pelo modelo (usado para ordenação, não é probabilidade calibrada).
     score                NUMERIC(6,4) NOT NULL,
     -- Posição no ranking desta oferta dentro da lista do cliente (1 = melhor).
     rank                 INTEGER      NOT NULL,
@@ -151,3 +151,16 @@ CREATE INDEX IF NOT EXISTS idx_reco_offers_customer
 -- Índice para agrupar/filtrar por batch.
 CREATE INDEX IF NOT EXISTS idx_reco_offers_batch
     ON reco.offers (offer_batch_id);
+
+-- ---------------------------------------------------------------------------
+-- Adiciona coluna auc_roc à tabela de avaliação (métricas de classificação).
+-- ---------------------------------------------------------------------------
+ALTER TABLE reco.evaluation_runs
+  ADD COLUMN IF NOT EXISTS auc_roc NUMERIC(6,4);
+
+-- ---------------------------------------------------------------------------
+-- Adiciona coluna hit_rate_at_k à tabela de avaliação.
+-- Hit Rate@K = percentual de clientes com ao menos 1 acerto no top-K.
+-- ---------------------------------------------------------------------------
+ALTER TABLE reco.evaluation_runs
+  ADD COLUMN IF NOT EXISTS hit_rate_at_k NUMERIC(6,4);

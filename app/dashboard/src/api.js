@@ -42,3 +42,21 @@ export async function apiFetch(url, options = {}) {
 
   return response
 }
+
+function _decodeTokenPayload() {
+  const token = getToken()
+  if (!token) return null
+  try {
+    return JSON.parse(atob(token.split('.')[1]))
+  } catch {
+    return null
+  }
+}
+
+export function getUserRole() {
+  return _decodeTokenPayload()?.role || null
+}
+
+export function getUsername() {
+  return _decodeTokenPayload()?.sub || null
+}

@@ -3,7 +3,7 @@
 # [Proposto] — comandos operacionais principais
 # =============================================================
 
-.PHONY: help up down logs restart psql etl-sales etl-customers etl-products etl-stores etl reco baseline test clean status lifecycle-refresh
+.PHONY: help up down logs restart psql etl-sales etl-customers etl-products etl-stores etl reco baseline test clean status lifecycle-refresh seed-users feedback validate-offers validate-whatsapp validate-whatsapp-dry
 
 # Carrega variáveis do .env para uso no make
 include .env
@@ -32,9 +32,17 @@ help:
 	@echo "    make etl-products Carregar produtos"
 	@echo "    make etl-stores   Carregar lojas"
 	@echo ""
+	@echo "  Feedback:"
+	@echo "    make feedback     Executar cross-reference ofertas vs vendas"
+	@echo ""
 	@echo "  ML:"
 	@echo "    make baseline     Gerar recomendações (Modelo 0)"
 	@echo "    make reco         Gerar recomendações completas (todos os modelos)"
+	@echo "    make validate-offers  Validar qualidade das ofertas geradas"
+	@echo ""
+	@echo "  WhatsApp:"
+	@echo "    make validate-whatsapp      Validar numeros via Evolution API"
+	@echo "    make validate-whatsapp-dry   Dry-run (mostra pendentes sem validar)"
 	@echo ""
 	@echo "  Testes:"
 	@echo "    make test         Rodar testes automatizados"
@@ -67,7 +75,10 @@ ddl:
 	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/00_schemas.sql
 	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/01_staging.sql
 	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/02_curated.sql
-	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/03_reco.sql
+	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/03_dw_marts.sql
+	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/04_auth.sql
+	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/05_feedback.sql
+	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -f sql/ddl/06_whatsapp_cache.sql
 
 lifecycle-refresh:
 	psql -h $(PG_HOST) -p $(PG_PORT) -U $(PG_USER) -d $(PG_DB) -c "REFRESH MATERIALIZED VIEW CONCURRENTLY reco.product_lifecycle;"
@@ -85,16 +96,36 @@ etl-customers:
 etl-sales:
 	python etl/load_sales.py
 
-etl: etl-stores etl-products etl-customers etl-sales
+etl: etl-stores etl-products etl-customers etl-sales feedback
+
+# --- Feedback ---
+feedback:
+	python ml/feedback_loop.py
 
 # --- ML ---
 baseline:
 	python ml/baseline.py
 
 reco:
-	python ml/candidate_generation.py
-	python ml/ranking.py
-	python ml/apply_rules.py
+	python3 ml/baseline.py
+	python3 ml/modelo_a_ranker.py --force-retrain
+	python3 ml/modelo_b_colaborativo.py
+	python3 ml/generate_offers.py
+	python3 ml/validate_offers.py
+
+validate-offers:
+	python3 ml/validate_offers.py
+
+# --- WhatsApp ---
+validate-whatsapp: ## Validar numeros de celular via Evolution API
+	python3 scripts/validate_whatsapp.py
+
+validate-whatsapp-dry: ## Mostra numeros pendentes sem chamar a API
+	python3 scripts/validate_whatsapp.py --dry-run
+
+# --- Seed ---
+seed-users: ## Inserir usuario inicial no banco (SEED_PASSWORD obrigatorio)
+	SEED_PASSWORD=$(SEED_PASSWORD) python3 scripts/seed_users.py
 
 # --- Testes ---
 test:

@@ -79,6 +79,9 @@ services:
       PG_DB: "${PG_DB}"
       PG_USER: "${PG_USER}"
       PG_PASSWORD: "${PG_PASSWORD}"
+      JWT_SECRET_KEY: "${JWT_SECRET_KEY}"
+      JWT_EXPIRE_MINUTES: "${JWT_EXPIRE_MINUTES:-480}"
+      CORS_ORIGINS: "${CORS_ORIGINS}"
     depends_on:
       reco-postgres:
         condition: service_healthy

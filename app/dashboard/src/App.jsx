@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Routes, Route } from 'react-router-dom'
 import ModelCard from './components/ModelCard'
 import MetricsChart from './components/MetricsChart'
@@ -6,7 +6,8 @@ import ComparisonChart from './components/ComparisonChart'
 import RunsTable from './components/RunsTable'
 import LoginPage from './components/LoginPage'
 import PrivateRoute from './components/PrivateRoute'
-import { logout, apiFetch } from './api.js'
+import { logout, apiFetch, getUserRole, getToken, setToken } from './api.js'
+import UsersPage from './components/UsersPage.jsx'
 import './index.css'
 
 const METRIC_OPTIONS = [
@@ -14,24 +15,40 @@ const METRIC_OPTIONS = [
   { value: 'precision_at_k', label: 'Precision@K' },
   { value: 'recall_at_k', label: 'Recall@K' },
   { value: 'map_at_k', label: 'MAP@K' },
+  { value: 'auc_roc', label: 'AUC-ROC' },
 ]
 
 export default function App() {
+  // SSO: ler token passado via URL ao vir do Business 360
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const tokenFromUrl = params.get('token')
+    if (tokenFromUrl) {
+      setToken(tokenFromUrl)
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+  }, [])
+
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/admin/users" element={<PrivateRoute><UsersPage /></PrivateRoute>} />
       <Route path="/*" element={<PrivateRoute><Dashboard /></PrivateRoute>} />
     </Routes>
   )
 }
 
 function Dashboard() {
+  const isAdmin = getUserRole() === 'admin'
   const [runs, setRuns] = useState([])
   const [strategies, setStrategies] = useState([])
   const [kValues, setKValues] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [refreshing, setRefreshing] = useState(false)
+  const [dataMeta, setDataMeta] = useState(null)
+  const [adminMenuOpen, setAdminMenuOpen] = useState(false)
+  const adminMenuRef = useRef(null)
 
   // Filters
   const [selectedStrategy, setSelectedStrategy] = useState('all')
@@ -78,6 +95,23 @@ function Dashboard() {
   useEffect(() => {
     fetchData()
   }, [fetchData])
+
+  useEffect(() => {
+    apiFetch('/api/business/meta')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) setDataMeta(d) })
+      .catch(() => null)
+  }, [])
+
+  useEffect(() => {
+    function handleClickOutside(e) {
+      if (adminMenuRef.current && !adminMenuRef.current.contains(e.target)) {
+        setAdminMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
 
   // Build latestRunsByK per strategy (latest evaluated_at for each k)
   const latestRunsByStrategy = {}
@@ -146,6 +180,21 @@ function Dashboard() {
               <span>Última avaliação</span>
               <strong>{lastEvaluatedAt}</strong>
             </div>
+            {dataMeta?.last_sale_date && (
+              <div className="last-update" style={{ borderLeft: '2px solid var(--purple)', paddingLeft: 10 }}>
+                <span>Dados até</span>
+                <strong style={{ color: 'var(--purple)' }}>
+                  {new Date(dataMeta.last_sale_date + 'T12:00:00').toLocaleDateString('pt-BR', {
+                    day: '2-digit', month: '2-digit', year: 'numeric',
+                  })}
+                </strong>
+                <span style={{ fontSize: 11, color: '#64748b', marginTop: 1 }}>
+                  Próx. atualização:{' '}
+                  {new Date(new Date(dataMeta.last_sale_date + 'T12:00:00').getTime() + 86400000)
+                    .toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' })}
+                </span>
+              </div>
+            )}
             <button
               className="refresh-btn"
               onClick={() => fetchData(true)}
@@ -154,6 +203,37 @@ function Dashboard() {
               {refreshing ? '↻ Atualizando…' : '↻ Atualizar'}
             </button>
             <button className="logout-btn" onClick={logout} title="Sair">Sair</button>
+            {isAdmin && (
+              <div style={{ position: 'relative' }} ref={adminMenuRef}>
+                <button
+                  className="refresh-btn"
+                  style={{ marginLeft: 8 }}
+                  onClick={() => setAdminMenuOpen(o => !o)}
+                >
+                  Administração ▾
+                </button>
+                {adminMenuOpen && (
+                  <div style={{
+                    position: 'absolute', right: 0, top: 'calc(100% + 4px)',
+                    background: '#fff', border: '1px solid #e2e8f0', borderRadius: 8,
+                    boxShadow: '0 4px 20px rgba(0,0,0,0.12)', minWidth: 180, zIndex: 100,
+                  }}>
+                    <button
+                      onClick={() => { setAdminMenuOpen(false); window.location.href = '/admin/users' }}
+                      style={{
+                        display: 'block', width: '100%', textAlign: 'left',
+                        padding: '10px 16px', background: 'none', border: 'none',
+                        cursor: 'pointer', fontSize: 14, color: '#374151',
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'none'}
+                    >
+                      Usuários
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </header>

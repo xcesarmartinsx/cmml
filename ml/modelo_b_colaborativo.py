@@ -91,6 +91,13 @@ LOG = setup_logging("ml.modelo_b")
 MODEL_DIR  = _PROJECT_ROOT / "app" / "ml" / "models" / "classification"
 MODEL_PATH = MODEL_DIR / "modelo_b_colaborativo_v1.pkl"
 
+# Produtos a excluir — não são produtos reais de venda (serviços/taxas).
+PRODUCT_BLACKLIST = [
+    'BORDADO',
+    'TAXA DE ENTREGA',
+    'TAXA ENTREGA',
+]
+
 # Parâmetros do SVD
 DEFAULT_N_FACTORS = 64     # dimensões do espaço latente
                             # ↑ mais fatores = mais expressivo, mais lento
@@ -141,6 +148,7 @@ def load_order_history(pg, history_days: int = HISTORY_DAYS) -> pd.DataFrame:
            AND sc.source_system   = 'sqlserver_gp'
         WHERE oi.sale_date >= '{cutoff}'
           AND p.active = TRUE
+          AND p.description NOT IN ({','.join(f"'{p}'" for p in PRODUCT_BLACKLIST)})
           AND sc.name NOT ILIKE '%BALCAO%'     -- exclui CLIENTE BALCAO (walk-in sem cadastro)
           AND sc.name NOT ILIKE '%CONSUMIDOR%' -- exclui CONSUMIDOR FINAL
           AND sc.name NOT ILIKE '%GENERICO%'   -- exclui clientes genéricos
@@ -248,6 +256,29 @@ def build_interaction_matrix(
     # que compraram muito o mesmo produto (compradores "fanáticos" não devem
     # dominar completamente a similaridade)
     data = np.log1p(data)
+
+    # Boost for offer conversions: pairs that converted from offers get extra weight
+    try:
+        import psycopg2 as _pg2
+        feedback_pg = get_pg_conn()
+        conversion_query = """
+            SELECT o.customer_id, o.product_id, COUNT(*) AS conversion_count
+            FROM reco.offers o
+            JOIN reco.offer_outcomes oo ON oo.offer_id = o.offer_id AND oo.converted = TRUE
+            GROUP BY o.customer_id, o.product_id
+        """
+        conv_df = pd.read_sql(conversion_query, feedback_pg)
+        feedback_pg.close()
+
+        if not conv_df.empty:
+            conv_merged = interactions.merge(conv_df, on=["customer_id", "product_id"], how="left")
+            conversion_counts = conv_merged["conversion_count"].fillna(0).values.astype(np.float32)
+            # Boost: weight = log(1 + purchase_count + 0.5 * offer_conversion_count)
+            raw_counts = interactions["purchase_count"].values.astype(np.float32)
+            data = np.log1p(raw_counts + 0.5 * conversion_counts)
+            LOG.info(f"Offer conversion boost applied to {(conversion_counts > 0).sum():,} pairs")
+    except Exception as exc:
+        LOG.warning(f"Could not apply offer conversion boost (table may not exist yet): {exc}")
 
     # Cria matriz esparsa CSR (Compressed Sparse Row) — eficiente para SVD
     matrix = sparse.csr_matrix(
@@ -392,6 +423,7 @@ def generate_collaborative_recommendations(
     neighbors: Dict[int, List[int]],
     top_n: int = DEFAULT_TOP_N,
     exclude_recently_bought_days: int = 30,
+    include_ever_bought: bool = True,
 ) -> pd.DataFrame:
     """
     Gera recomendações colaborativas usando os vizinhos mais similares.
@@ -399,19 +431,22 @@ def generate_collaborative_recommendations(
     Algoritmo:
     1. Para o cliente C, identifica seus K vizinhos mais similares
     2. Coleta todos os produtos comprados pelos vizinhos
-    3. Exclui produtos que C já comprou recentemente (janela de recompra)
+    3. Exclui produtos que C comprou recentemente (janela de recompra)
     4. Ordena por popularidade entre os vizinhos (quantos vizinhos compraram)
     5. Retorna top_n
 
-    Score = número de vizinhos que compraram o produto
+    Score = numero de vizinhos que compraram o produto
     (normalizado pelo total de vizinhos)
 
-    Parâmetros
+    Parametros
     ----------
-    df_train                    : histórico de treino (para saber o que cada um comprou)
+    df_train                    : historico de treino (para saber o que cada um comprou)
     neighbors                   : {customer_id: [neighbor_ids]}
-    top_n                       : número de recomendações por cliente
-    exclude_recently_bought_days: janela de exclusão (produtos comprados recentemente)
+    top_n                       : numero de recomendacoes por cliente
+    exclude_recently_bought_days: janela de exclusao (produtos comprados recentemente)
+    include_ever_bought         : se True, permite recomendar produtos que o cliente ja
+                                  comprou (foco em recompra); filtra apenas compras recentes.
+                                  Se False, comportamento original (exclui tudo que ja comprou).
 
     Retorna
     -------
@@ -449,9 +484,15 @@ def generate_collaborative_recommendations(
 
         for neighbor_id in neighbor_ids:
             for pid in customer_products.get(neighbor_id, set()):
-                # Exclui produtos que o cliente já conhece ou comprou recentemente
-                if pid not in own_products and pid not in recent_bought:
-                    product_votes[pid] = product_votes.get(pid, 0) + 1
+                if include_ever_bought:
+                    # Modo recompra: exclui apenas compras recentes, permite
+                    # recomendar produtos que o cliente ja comprou no passado
+                    if pid not in recent_bought:
+                        product_votes[pid] = product_votes.get(pid, 0) + 1
+                else:
+                    # Modo original: exclui tudo que o cliente ja comprou
+                    if pid not in own_products and pid not in recent_bought:
+                        product_votes[pid] = product_votes.get(pid, 0) + 1
 
         if not product_votes:
             # Sem candidatos — o cliente e seus vizinhos compraram tudo

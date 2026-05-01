@@ -14,8 +14,10 @@ from routers.business import router as business_router
 from routers.recommendations import router as recommendations_router
 # Importa o router de autenticacao JWT
 from routers.auth import router as auth_router
+# Importa o router de administracao de usuarios
+from routers.users import router as users_router
 # Importa dependencias compartilhadas
-from deps import get_current_user, init_pool, close_pool, get_db, release_db, limiter, _default_rate
+from deps import get_current_user, require_admin, init_pool, close_pool, get_db, release_db, limiter, _default_rate
 
 
 # ── Lifespan (startup/shutdown) ──────────────────────────────────────────────
@@ -50,7 +52,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -75,6 +77,12 @@ app.include_router(
 app.include_router(
     recommendations_router,
     dependencies=[Depends(get_current_user)],
+)
+# Registra as rotas de administracao de usuarios (/api/admin/*) — protegidas por JWT (admin only)
+app.include_router(
+    users_router,
+    prefix="/api/admin",
+    tags=["admin"],
 )
 
 

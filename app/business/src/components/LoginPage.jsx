@@ -49,8 +49,19 @@ export default function LoginPage() {
     <div className="login-container">
       <form className="login-form" onSubmit={handleSubmit}>
         <div className="login-header">
+          <img
+            src="/logo.png"
+            alt="Logo"
+            style={{
+              maxWidth: '160px',
+              maxHeight: '80px',
+              objectFit: 'contain',
+              marginBottom: '8px',
+            }}
+            onError={(e) => { e.target.style.display = 'none' }}
+          />
           <h1>CMML</h1>
-          <p>Visao 360 Empresarial</p>
+          <p>Visão 360° Empresarial</p>
         </div>
 
         {error && <div className="login-error">{error}</div>}

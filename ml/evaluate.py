@@ -390,7 +390,7 @@ def evaluate_binary_classifier(
 def find_optimal_threshold(
     y_true: np.ndarray,
     y_pred_proba: np.ndarray,
-    metric: str = "f1",
+    metric: str = "f1-score",
 ) -> Tuple[float, float]:
     """
     Encontra o threshold ótimo de classificação por busca em grade.
@@ -404,7 +404,8 @@ def find_optimal_threshold(
     ----------
     y_true       : rótulos verdadeiros
     y_pred_proba : probabilidades previstas
-    metric       : 'f1' | 'recall' | 'precision' — métrica a maximizar
+    metric       : 'f1-score' | 'recall' | 'precision' — métrica a maximizar
+                     (chaves do classification_report do sklearn)
 
     Retorna
     -------
@@ -472,6 +473,8 @@ def save_metrics_to_db(
     df_metrics: pd.DataFrame,
     strategy: str,
     notes: str = "",
+    auc_roc: Optional[float] = None,
+    hit_rate_at_k: Optional[float] = None,
 ) -> None:
     """
     Persiste as métricas de avaliação em reco.evaluation_runs.
@@ -481,18 +484,23 @@ def save_metrics_to_db(
 
     Parâmetros
     ----------
-    pg         : conexão psycopg2
-    df_metrics : DataFrame de evaluate_ranking()
-    strategy   : nome da estratégia ('modelo_a_ranker', 'modelo_b_colaborativo', ...)
-    notes      : observações livres (ex.: versão, hiperparâmetros usados)
+    pg             : conexão psycopg2
+    df_metrics     : DataFrame de evaluate_ranking()
+    strategy       : nome da estratégia ('modelo_a_ranker', 'modelo_b_colaborativo', ...)
+    notes          : observações livres (ex.: versão, hiperparâmetros usados)
+    auc_roc        : AUC-ROC do classificador binário (opcional, apenas Modelo A)
+    hit_rate_at_k  : Hit Rate@K global (opcional; se None, extrai do DataFrame)
     """
     with pg.cursor() as cur:
         for _, row in df_metrics.iterrows():
+            # Usa hit_rate do DataFrame se disponivel, senao o parametro global
+            row_hit_rate = row.get("hit_rate") if "hit_rate" in row.index else hit_rate_at_k
             cur.execute(
                 """
                 INSERT INTO reco.evaluation_runs
-                    (strategy, k, precision_at_k, recall_at_k, ndcg_at_k, map_at_k, n_customers, notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (strategy, k, precision_at_k, recall_at_k, ndcg_at_k, map_at_k,
+                     n_customers, notes, auc_roc, hit_rate_at_k)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     strategy,
@@ -503,7 +511,472 @@ def save_metrics_to_db(
                     float(row["map"]),
                     int(row["n_customers"]),
                     notes,
+                    float(auc_roc) if auc_roc is not None else None,
+                    float(row_hit_rate) if row_hit_rate is not None else None,
                 ),
             )
     pg.commit()
     LOG.info(f"Métricas salvas em reco.evaluation_runs para strategy='{strategy}'")
+
+
+# ===========================================================================
+# SECTION 5 — CONVERSION METRICS (Real-world feedback)
+# ===========================================================================
+
+def conversion_rate_at_k(
+    pg,
+    strategy: Optional[str] = None,
+    k: int = 10,
+    batch_id: Optional[str] = None,
+) -> Dict:
+    """
+    Taxa de conversao real das top-K ofertas enviadas.
+
+    Mede: das ofertas com rank <= K que foram avaliadas, quantas converteram?
+    """
+    filters = ["o.rank <= %s"]
+    params = [k]
+    if strategy:
+        filters.append("o.strategy = %s")
+        params.append(strategy)
+    if batch_id:
+        filters.append("o.offer_batch_id = %s::uuid")
+        params.append(batch_id)
+
+    where = " AND ".join(filters)
+
+    with pg.cursor() as cur:
+        cur.execute(f"""
+            SELECT
+                COUNT(DISTINCT o.offer_id) AS total_offers,
+                COUNT(DISTINCT oo.offer_id) FILTER (WHERE oo.converted = TRUE) AS converted,
+                COUNT(DISTINCT oo.offer_id) FILTER (WHERE oo.converted IS NOT NULL) AS evaluated
+            FROM reco.offers o
+            LEFT JOIN reco.offer_outcomes oo ON oo.offer_id = o.offer_id
+            WHERE {where}
+        """, params)
+        row = cur.fetchone()
+
+    total, converted, evaluated = row
+    rate = round(converted * 100.0 / evaluated, 2) if evaluated > 0 else 0.0
+
+    result = {
+        "k": k,
+        "total_offers": total,
+        "evaluated": evaluated,
+        "converted": converted,
+        "conversion_rate": rate,
+    }
+    LOG.info(f"Conversion Rate @{k}: {rate}% ({converted}/{evaluated})")
+    return result
+
+
+def incremental_lift(
+    pg,
+    strategy: Optional[str] = None,
+    window_days: int = 30,
+) -> Dict:
+    """
+    Lift incremental (cohort-matched): compara taxa de conversao de ofertas
+    vs taxa de compra organica dos MESMOS clientes para produtos NAO oferecidos.
+
+    Abordagem cohort-matched:
+      - Numerador: taxa de conversao das ofertas (avaliadas pelo feedback loop)
+      - Denominador: taxa de compra dos MESMOS clientes que receberam ofertas,
+        para produtos que NAO foram oferecidos, na MESMA janela temporal.
+
+    Isso elimina o vies de seleçao (clientes que recebem ofertas podem ser
+    naturalmente mais ativos) e o denominador astronomico do CROSS JOIN.
+
+    lift = (conversion_rate_offers) / (organic_purchase_rate_cohort)
+    lift > 1.0 = ofertas estao gerando vendas incrementais
+
+    Tambem calcula intervalo de confianca binomial (Wilson) para o lift.
+    """
+    strategy_filter = ""
+    params = [window_days]
+    if strategy:
+        strategy_filter = "AND o.strategy = %s"
+        params.append(strategy)
+
+    with pg.cursor() as cur:
+        # Offer conversion rate
+        cur.execute(f"""
+            SELECT
+                COUNT(DISTINCT oo.offer_id) FILTER (WHERE oo.converted = TRUE) AS offer_converted,
+                COUNT(DISTINCT oo.offer_id) FILTER (WHERE oo.converted IS NOT NULL) AS offer_evaluated
+            FROM reco.offers o
+            JOIN reco.offer_outcomes oo ON oo.offer_id = o.offer_id
+            WHERE (o.generated_at + make_interval(days => %s))::date <= CURRENT_DATE
+            {strategy_filter}
+        """, params)
+        offer_row = cur.fetchone()
+        offer_converted, offer_evaluated = offer_row
+
+        # Organic rate (cohort-matched):
+        # Para os MESMOS clientes que receberam ofertas, conta compras de
+        # produtos que NAO foram oferecidos, na mesma janela temporal.
+        # Denominador = total de pares (cliente, produto_nao_oferecido) distintos
+        # que esses clientes poderiam ter comprado (produtos ativos nao oferecidos).
+        cur.execute(f"""
+            WITH offered_customers AS (
+                SELECT DISTINCT o.customer_id
+                FROM reco.offers o
+                JOIN reco.offer_outcomes oo ON oo.offer_id = o.offer_id
+                WHERE (o.generated_at + make_interval(days => %s))::date <= CURRENT_DATE
+                {strategy_filter}
+            ),
+            offered_pairs AS (
+                SELECT DISTINCT o.customer_id, o.product_id
+                FROM reco.offers o
+                WHERE EXISTS (SELECT 1 FROM offered_customers oc WHERE oc.customer_id = o.customer_id)
+            ),
+            organic_purchases AS (
+                SELECT DISTINCT oi.customer_id, oi.product_id
+                FROM cur.order_items oi
+                JOIN offered_customers oc ON oc.customer_id = oi.customer_id
+                WHERE oi.sale_date >= CURRENT_DATE - make_interval(days => %s)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM offered_pairs op
+                      WHERE op.customer_id = oi.customer_id
+                        AND op.product_id = oi.product_id
+                  )
+            ),
+            organic_denominator AS (
+                SELECT COUNT(DISTINCT (oc.customer_id, p.product_id)) AS potential_organic_pairs
+                FROM offered_customers oc
+                CROSS JOIN cur.products p
+                WHERE p.active = TRUE
+                  AND NOT EXISTS (
+                      SELECT 1 FROM offered_pairs op
+                      WHERE op.customer_id = oc.customer_id
+                        AND op.product_id = p.product_id
+                  )
+            )
+            SELECT
+                (SELECT COUNT(*) FROM organic_purchases) AS organic_purchases,
+                (SELECT potential_organic_pairs FROM organic_denominator) AS potential_pairs
+        """, params + [window_days])
+        organic_row = cur.fetchone()
+
+    offer_rate = offer_converted / offer_evaluated if offer_evaluated > 0 else 0
+    organic_purchases, potential_pairs = organic_row
+    organic_rate = organic_purchases / potential_pairs if potential_pairs > 0 else 0
+    lift = offer_rate / organic_rate if organic_rate > 0 else float('inf') if offer_rate > 0 else 0
+
+    # Intervalo de confianca binomial (Wilson) para as duas taxas
+    offer_ci_low, offer_ci_high = None, None
+    organic_ci_low, organic_ci_high = None, None
+    try:
+        from statsmodels.stats.proportion import proportion_confint
+        if offer_evaluated > 0:
+            offer_ci_low, offer_ci_high = proportion_confint(
+                offer_converted, offer_evaluated, alpha=0.05, method="wilson"
+            )
+        if potential_pairs > 0:
+            organic_ci_low, organic_ci_high = proportion_confint(
+                organic_purchases, potential_pairs, alpha=0.05, method="wilson"
+            )
+    except ImportError:
+        LOG.warning("statsmodels nao disponivel; CI nao calculado para incremental_lift.")
+
+    result = {
+        "offer_conversion_rate": round(offer_rate * 100, 2),
+        "organic_purchase_rate": round(organic_rate * 100, 4),
+        "lift": round(lift, 2),
+        "offer_converted": offer_converted,
+        "offer_evaluated": offer_evaluated,
+        "organic_purchases": organic_purchases,
+        "organic_potential_pairs": potential_pairs,
+        "offer_ci_95": (
+            round(offer_ci_low * 100, 2) if offer_ci_low is not None else None,
+            round(offer_ci_high * 100, 2) if offer_ci_high is not None else None,
+        ),
+        "organic_ci_95": (
+            round(organic_ci_low * 100, 4) if organic_ci_low is not None else None,
+            round(organic_ci_high * 100, 4) if organic_ci_high is not None else None,
+        ),
+    }
+    LOG.info(f"Incremental Lift (cohort-matched): {lift:.2f}x "
+             f"(offer={offer_rate*100:.2f}% vs organic={organic_rate*100:.4f}%)")
+    return result
+
+
+def model_comparison_by_conversion(pg) -> List[Dict]:
+    """
+    Comparativo Modelo A vs Modelo B por conversao real.
+
+    Retorna metricas de conversao separadas por estrategia.
+
+    NOTA: Como ambos os modelos operam sobre a mesma populacao de clientes,
+    esta comparacao e observacional e NAO estabelece causalidade.
+    Para comparacao causal, implementar A/B testing com experiment_assignments.
+    """
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT
+                o.strategy,
+                COUNT(DISTINCT o.offer_id)::int AS total_offers,
+                COUNT(DISTINCT oo.offer_id) FILTER (WHERE oo.converted IS NOT NULL)::int AS evaluated,
+                COUNT(DISTINCT oo.offer_id) FILTER (WHERE oo.converted = TRUE)::int AS converted,
+                ROUND(AVG(o.score) * 100, 1)::float AS avg_score_pct,
+                COALESCE(SUM(oo.total_value) FILTER (WHERE oo.converted = TRUE), 0)::float AS total_value
+            FROM reco.offers o
+            LEFT JOIN reco.offer_outcomes oo ON oo.offer_id = o.offer_id
+            GROUP BY o.strategy
+            ORDER BY o.strategy
+        """)
+        rows = cur.fetchall()
+
+    results = []
+    for row in rows:
+        strategy, total, evaluated, converted, avg_score, total_value = row
+        rate = round(converted * 100.0 / evaluated, 2) if evaluated > 0 else 0
+        results.append({
+            "strategy": strategy,
+            "total_offers": total,
+            "evaluated": evaluated,
+            "converted": converted,
+            "conversion_rate": rate,
+            "avg_score_pct": avg_score,
+            "total_converted_value": total_value,
+        })
+        LOG.info(f"  {strategy}: {rate}% conversion ({converted}/{evaluated}), value=R${total_value:,.2f}")
+
+    return results
+
+
+# ===========================================================================
+# SECTION 6 — TESTES ESTATISTICOS (Inferencia para A/B testing)
+# ===========================================================================
+
+def compare_conversion_rates(
+    n_a: int,
+    conv_a: int,
+    n_b: int,
+    conv_b: int,
+    alpha: float = 0.05,
+) -> Dict:
+    """
+    Two-proportion z-test para comparar taxas de conversao entre dois grupos.
+
+    Exemplo de uso: comparar Modelo A vs Modelo B, ou Treatment vs Control
+    em um A/B test.
+
+    Usa statsmodels.stats.proportion.proportions_ztest para o teste bicaudal
+    e Wilson confidence intervals (mais robustos que Wald para proporcoes
+    pequenas ou proximas de 0/1).
+
+    Parametros
+    ----------
+    n_a    : total de ofertas avaliadas no grupo A
+    conv_a : ofertas convertidas no grupo A
+    n_b    : total de ofertas avaliadas no grupo B
+    conv_b : ofertas convertidas no grupo B
+    alpha  : nivel de significancia (padrao: 0.05)
+
+    Retorna
+    -------
+    dict com:
+        rate_a, rate_b        : taxas de conversao
+        diff                  : diferenca (rate_a - rate_b)
+        z_stat, p_value       : estatistica z e p-value bicaudal
+        significant           : True se p_value < alpha
+        ci_a, ci_b            : Wilson CI 95% para cada grupo
+        ci_diff               : CI aproximado para a diferenca
+    """
+    from statsmodels.stats.proportion import proportions_ztest, proportion_confint
+
+    rate_a = conv_a / n_a if n_a > 0 else 0.0
+    rate_b = conv_b / n_b if n_b > 0 else 0.0
+
+    # Two-proportion z-test (bicaudal)
+    count = np.array([conv_a, conv_b])
+    nobs = np.array([n_a, n_b])
+
+    if n_a == 0 or n_b == 0:
+        LOG.warning("Um dos grupos tem tamanho 0; teste nao pode ser realizado.")
+        return {
+            "rate_a": rate_a, "rate_b": rate_b, "diff": rate_a - rate_b,
+            "z_stat": None, "p_value": None, "significant": None,
+            "ci_a": (None, None), "ci_b": (None, None), "ci_diff": (None, None),
+        }
+
+    z_stat, p_value = proportions_ztest(count, nobs, alternative="two-sided")
+
+    # Wilson confidence intervals para cada grupo
+    ci_a_low, ci_a_high = proportion_confint(conv_a, n_a, alpha=alpha, method="wilson")
+    ci_b_low, ci_b_high = proportion_confint(conv_b, n_b, alpha=alpha, method="wilson")
+
+    # CI aproximado para a diferenca (Newcombe-Wilson)
+    diff = rate_a - rate_b
+    se_diff = np.sqrt(
+        (ci_a_high - ci_a_low) ** 2 / 4 + (ci_b_high - ci_b_low) ** 2 / 4
+    )
+    from scipy.stats import norm
+    z_crit = norm.ppf(1 - alpha / 2)
+    ci_diff_low = diff - z_crit * se_diff
+    ci_diff_high = diff + z_crit * se_diff
+
+    significant = bool(p_value < alpha)
+
+    LOG.info(
+        f"Two-proportion z-test: rate_A={rate_a:.4f} vs rate_B={rate_b:.4f} | "
+        f"diff={diff:+.4f} | z={z_stat:.3f} | p={p_value:.4f} | "
+        f"significativo={'SIM' if significant else 'NAO'} (alpha={alpha})"
+    )
+
+    return {
+        "rate_a": round(rate_a, 6),
+        "rate_b": round(rate_b, 6),
+        "diff": round(diff, 6),
+        "z_stat": round(float(z_stat), 4),
+        "p_value": round(float(p_value), 6),
+        "significant": significant,
+        "ci_a": (round(ci_a_low, 6), round(ci_a_high, 6)),
+        "ci_b": (round(ci_b_low, 6), round(ci_b_high, 6)),
+        "ci_diff": (round(ci_diff_low, 6), round(ci_diff_high, 6)),
+    }
+
+
+def bootstrap_ranking_ci(
+    reco_per_customer: Dict[int, List],
+    relevant_per_customer: Dict[int, List],
+    k: int,
+    metric_fn,
+    n_boot: int = 1000,
+    alpha: float = 0.05,
+) -> Dict:
+    """
+    Bootstrap confidence interval para metricas de ranking, reamostrando clientes.
+
+    Metricas de ranking (Precision@K, NDCG@K, MAP@K, HitRate@K) nao tem
+    distribuicao analitica conhecida. Bootstrap CI reamostra clientes com
+    reposicao e calcula a distribuicao empirica da metrica agregada.
+
+    IMPORTANTE: Reamostra clientes (nao ofertas individuais) para preservar
+    a correlacao intra-cliente (multiplas ofertas por cliente sao dependentes).
+
+    Parametros
+    ----------
+    reco_per_customer     : {customer_id: [product_ids recomendados]}
+    relevant_per_customer : {customer_id: [product_ids comprados]}
+    k                     : corte para a metrica
+    metric_fn             : funcao que calcula a metrica por cliente
+                            assinatura: metric_fn(recommended, relevant, k) -> float
+    n_boot                : numero de iteracoes bootstrap (padrao: 1000)
+    alpha                 : nivel de significancia para o CI (padrao: 0.05)
+
+    Retorna
+    -------
+    dict com:
+        mean       : media da metrica
+        ci_lower   : limite inferior do CI
+        ci_upper   : limite superior do CI
+        std        : desvio padrao bootstrap
+        n_customers: numero de clientes usados
+    """
+    # Clientes em comum entre recomendacoes e ground truth
+    customers = np.array([
+        c for c in reco_per_customer if c in relevant_per_customer
+    ])
+    n = len(customers)
+
+    if n == 0:
+        LOG.warning("Nenhum cliente em comum para bootstrap CI.")
+        return {"mean": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "std": 0.0, "n_customers": 0}
+
+    rng = np.random.default_rng(seed=42)
+    boot_scores = np.zeros(n_boot)
+
+    for b in range(n_boot):
+        # Reamostra clientes com reposicao
+        sample_customers = rng.choice(customers, size=n, replace=True)
+        scores = [
+            metric_fn(reco_per_customer[c], relevant_per_customer[c], k)
+            for c in sample_customers
+        ]
+        boot_scores[b] = np.mean(scores)
+
+    # Percentile CI
+    ci_lower = float(np.percentile(boot_scores, 100 * alpha / 2))
+    ci_upper = float(np.percentile(boot_scores, 100 * (1 - alpha / 2)))
+    mean_val = float(np.mean(boot_scores))
+    std_val = float(np.std(boot_scores))
+
+    LOG.info(
+        f"Bootstrap CI ({1-alpha:.0%}): mean={mean_val:.4f} "
+        f"[{ci_lower:.4f}, {ci_upper:.4f}] (n_boot={n_boot}, n_customers={n})"
+    )
+
+    return {
+        "mean": round(mean_val, 6),
+        "ci_lower": round(ci_lower, 6),
+        "ci_upper": round(ci_upper, 6),
+        "std": round(std_val, 6),
+        "n_customers": n,
+    }
+
+
+def required_sample_size(
+    baseline_rate: float,
+    mde: float,
+    alpha: float = 0.05,
+    power: float = 0.80,
+) -> Dict:
+    """
+    Power analysis: calcula tamanho de amostra necessario para um A/B test.
+
+    Responde: "Quantos clientes preciso em cada grupo para detectar uma
+    diferenca de `mde` pontos percentuais na taxa de conversao, com
+    significancia `alpha` e poder `power`?"
+
+    Usa o teste de proporcoes (NormalIndPower) do statsmodels.
+
+    Parametros
+    ----------
+    baseline_rate : taxa de conversao do grupo controle (ex.: 0.05 = 5%)
+    mde           : minima diferenca detectavel em pontos absolutos (ex.: 0.02 = 2pp)
+    alpha         : nivel de significancia (padrao: 0.05)
+    power         : poder estatistico desejado (padrao: 0.80)
+
+    Retorna
+    -------
+    dict com:
+        sample_size_per_group : clientes necessarios POR GRUPO
+        total_sample_size     : total para dois grupos
+        effect_size           : tamanho do efeito (Cohen's h)
+        baseline_rate         : taxa baseline usada
+        mde                   : MDE usada
+    """
+    from statsmodels.stats.power import NormalIndPower
+
+    # Cohen's h para duas proporcoes
+    p1 = baseline_rate
+    p2 = baseline_rate + mde
+    effect_size = 2 * (np.arcsin(np.sqrt(p2)) - np.arcsin(np.sqrt(p1)))
+
+    analysis = NormalIndPower()
+    n_per_group = analysis.solve_power(
+        effect_size=effect_size,
+        alpha=alpha,
+        power=power,
+        alternative="two-sided",
+    )
+    n_per_group = int(np.ceil(n_per_group))
+
+    LOG.info(
+        f"Power analysis: baseline={baseline_rate:.2%}, MDE={mde:.2%}, "
+        f"alpha={alpha}, power={power} => {n_per_group:,} clientes/grupo "
+        f"({2*n_per_group:,} total)"
+    )
+
+    return {
+        "sample_size_per_group": n_per_group,
+        "total_sample_size": 2 * n_per_group,
+        "effect_size": round(float(effect_size), 4),
+        "baseline_rate": baseline_rate,
+        "mde": mde,
+        "alpha": alpha,
+        "power": power,
+    }

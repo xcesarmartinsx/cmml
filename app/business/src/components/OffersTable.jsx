@@ -3,7 +3,7 @@
  * ---------------
  * Exibe a lista de ofertas geradas pelos modelos de recomendação.
  *
- * Colunas: Cliente | Produto | % Chance | Contato | WhatsApp
+ * Colunas: Cliente | Produto | Relevância | Contato | WhatsApp
  *
  * O botão de WhatsApp não tem ação nesta versão (Phase 1).
  * O contato exibe o celular se disponível; caso contrário, o telefone fixo.
@@ -11,26 +11,77 @@
 import { useState, useEffect } from 'react'
 import { apiFetch } from '../api.js'
 import CustomerPurchaseModal from './CustomerPurchaseModal.jsx'
+import ConversionMetrics from './ConversionMetrics.jsx'
+import FeedbackUpload from './FeedbackUpload.jsx'
 
 const PAGE_SIZE = 50
 
 /**
- * Mascara o número de telefone para proteger PII.
- * Exibe apenas os 4 últimos dígitos: (**) *****-XXXX
+ * Formata o número de telefone para exibição legível.
+ * Ex: "11912345678" → "(11) 91234-5678"
  */
-function maskPhone(raw) {
+function formatPhone(raw) {
   if (!raw || !raw.trim()) return '—'
   const digits = raw.replace(/\D/g, '')
-  if (digits.length < 6) return '—'
-  const lastFour = digits.slice(-4)
-  return `(**) *****-${lastFour}`
+  if (digits.length < 10) return raw.trim()
+  if (digits.length === 11) {
+    return `(${digits.slice(0,2)}) ${digits.slice(2,7)}-${digits.slice(7)}`
+  }
+  if (digits.length === 10) {
+    return `(${digits.slice(0,2)}) ${digits.slice(2,6)}-${digits.slice(6)}`
+  }
+  return raw.trim()
+}
+
+// ── Tooltip de produto com detalhes no hover ──────────────────────────────────
+function ProductTooltip({ row }) {
+  const [show, setShow] = useState(false)
+  return (
+    <span
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+      style={{ position: 'relative', cursor: 'default', display: 'block' }}
+    >
+      <span style={{
+        fontSize: 12, display: 'block', overflow: 'hidden',
+        textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+      }}>
+        {row.product_name || `Produto #${row.product_id}`}
+      </span>
+      {show && (
+        <div style={{
+          position: 'absolute', bottom: '100%', left: 0, zIndex: 100,
+          background: '#fff', border: '1px solid var(--border)',
+          borderRadius: 8, padding: '8px 12px',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+          whiteSpace: 'normal', fontSize: 12, minWidth: 280, maxWidth: 400,
+          pointerEvents: 'none',
+        }}>
+          <div style={{ fontWeight: 600, marginBottom: 4, wordBreak: 'break-word' }}>
+            {row.product_name || `Produto #${row.product_id}`}
+          </div>
+          <div style={{ color: 'var(--muted)', fontSize: 11 }}>ID: {row.product_id}</div>
+          <div style={{ color: 'var(--muted)', fontSize: 11 }}>
+            Valor: {(row.avg_unit_price ?? 0) > 0
+              ? row.avg_unit_price.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+              : '—'}
+          </div>
+          <div style={{ color: 'var(--muted)', fontSize: 11 }}>
+            Ultima compra: {row.last_purchase_date
+              ? new Date(row.last_purchase_date).toLocaleDateString('pt-BR')
+              : 'Nunca comprou'}
+          </div>
+        </div>
+      )}
+    </span>
+  )
 }
 
 // ── Badge de probabilidade ─────────────────────────────────────────────────────
 function ScoreBadge({ pct }) {
   const color =
-    pct >= 70 ? '#16a34a' :   // verde — alta probabilidade
-    pct >= 40 ? '#d97706' :   // âmbar — média probabilidade
+    pct >= 50 ? '#16a34a' :   // verde — alta probabilidade
+    pct >= 25 ? '#d97706' :   // âmbar — média probabilidade
                 '#dc2626'     // vermelho — baixa probabilidade
 
   return (
@@ -58,6 +109,25 @@ function WhatsAppIcon() {
   )
 }
 
+// ── Badge de tipo de telefone (WPP confirmado / Celular / Sem WPP / Fixo) ────
+function PhoneTypeBadge({ type }) {
+  const badges = {
+    whatsapp:      { label: 'WPP \u2713', bg: '#dcfce7', color: '#166534' },
+    mobile:        { label: 'Celular',  bg: '#fef3c7', color: '#92400e' },
+    mobile_no_wpp: { label: 'Sem WPP',  bg: '#fee2e2', color: '#991b1b' },
+    landline:      { label: 'Fixo',     bg: '#f3f4f6', color: '#6b7280' },
+  }
+  const b = badges[type]
+  if (!b) return null
+  return (
+    <span style={{
+      display: 'inline-block', padding: '1px 6px', borderRadius: 4,
+      fontSize: 10, fontWeight: 600, marginLeft: 6,
+      background: b.bg, color: b.color,
+    }}>{b.label}</span>
+  )
+}
+
 // ── Componente principal ───────────────────────────────────────────────────────
 export default function OffersTable() {
   const [data,         setData]         = useState([])
@@ -67,9 +137,14 @@ export default function OffersTable() {
   const [page,         setPage]         = useState(1)
   const [loading,      setLoading]      = useState(true)
   const [batchInfo,    setBatchInfo]    = useState(null)
-  const [sortDir,      setSortDir]      = useState(null) // null | 'desc' | 'asc'
+  const [sortKeys,     setSortKeys]     = useState([
+    { col: 'score', dir: 'desc' },
+    { col: 'price', dir: 'desc' },
+  ])
   const [selectedCustomer, setSelectedCustomer] = useState(null) // { id, name } | null
   const [exporting,        setExporting]        = useState(false)
+  const [showFeedbackUpload, setShowFeedbackUpload] = useState(false)
+  const [exportingFeedback, setExportingFeedback] = useState(false)
 
   // Carrega lista de batches disponíveis
   useEffect(() => {
@@ -81,10 +156,10 @@ export default function OffersTable() {
       .catch(() => {})
   }, [])
 
-  // Carrega ofertas sempre que a estratégia muda
+  // Carrega ofertas quando estratégia muda (ordenação é client-side)
   useEffect(() => {
     setLoading(true)
-    const params = new URLSearchParams({ limit: 500 })
+    const params = new URLSearchParams({ limit: 5000 })
     if (strategy) params.set('strategy', strategy)
 
     apiFetch(`/api/recommendations/offers?${params}`)
@@ -119,8 +194,55 @@ export default function OffersTable() {
     }
   }
 
-  // Volta para página 1 quando qualquer filtro muda
-  useEffect(() => { setPage(1) }, [strategy, minScore, lastPurchase])
+  async function handleExportFeedback() {
+    setExportingFeedback(true)
+    try {
+      const params = new URLSearchParams()
+      if (strategy) params.set('strategy', strategy)
+      const resp = await apiFetch(`/api/recommendations/offers/export-feedback?${params}`)
+      if (!resp.ok) throw new Error('Falha na exportacao')
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const disposition = resp.headers.get('Content-Disposition') || ''
+      const match = disposition.match(/filename="?([^"]+)"?/)
+      a.download = match ? match[1] : `feedback_ofertas_${new Date().toISOString().slice(0,10)}.xlsx`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      console.error('Erro ao exportar feedback:', e)
+    } finally {
+      setExportingFeedback(false)
+    }
+  }
+
+  // Toggle de ordenação multi-coluna ao clicar na coluna
+  function toggleSort(col) {
+    setSortKeys(prev => {
+      if (prev[0]?.col === col) {
+        // Ja e primario: inverte direcao
+        return [{ col, dir: prev[0].dir === 'desc' ? 'asc' : 'desc' }, ...prev.slice(1)]
+      }
+      // Promove para primario, antigo primario vira secundario
+      const rest = prev.filter(s => s.col !== col)
+      return [{ col, dir: 'desc' }, ...rest]
+    })
+  }
+
+  // Seta indicadora de direcao (com indicador de prioridade)
+  function sortArrow(col) {
+    const idx = sortKeys.findIndex(s => s.col === col)
+    if (idx < 0) return ''
+    const arrow = sortKeys[idx].dir === 'desc' ? '\u2193' : '\u2191'
+    if (idx === 0) return ` ${arrow}`
+    return ` ${arrow}\u00B2`  // superscript 2 para indicar secundario
+  }
+
+  // Volta para pagina 1 quando qualquer filtro muda
+  useEffect(() => { setPage(1) }, [strategy, minScore, lastPurchase, sortKeys])
 
   const fmtDate = iso =>
     iso ? new Date(iso).toLocaleDateString('pt-BR', {
@@ -135,18 +257,20 @@ export default function OffersTable() {
       (lastPurchase === 'yes' ? row.last_purchase_date !== null : row.last_purchase_date === null))
   )
 
-  // Ordenação por % Chance
-  if (sortDir) {
-    filtered.sort((a, b) => {
-      const va = a.score_pct ?? 0
-      const vb = b.score_pct ?? 0
-      return sortDir === 'desc' ? vb - va : va - vb
-    })
-  }
+  // Ordenacao client-side multi-coluna
+  const sorted = [...filtered].sort((a, b) => {
+    for (const { col, dir } of sortKeys) {
+      const mult = dir === 'desc' ? -1 : 1
+      const va = col === 'score' ? (a.score_pct ?? 0) : (a.avg_unit_price ?? 0)
+      const vb = col === 'score' ? (b.score_pct ?? 0) : (b.avg_unit_price ?? 0)
+      if (va !== vb) return (va - vb) * mult
+    }
+    return 0
+  })
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
+  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE))
   const safePage   = Math.min(page, totalPages)
-  const paged      = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
+  const paged      = sorted.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
 
   // Botão de página simples
   const btnStyle = (disabled) => ({
@@ -162,6 +286,8 @@ export default function OffersTable() {
   })
 
   return (
+    <>
+    <ConversionMetrics />
     <div className="chart-card" style={{ padding: 0, overflow: 'hidden' }}>
 
       {/* ── Cabeçalho ─────────────────────────────────────────────────────── */}
@@ -198,7 +324,7 @@ export default function OffersTable() {
 
           {/* Filtro de % chance mínima */}
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <label style={{ fontSize: 12, color: 'var(--muted)', whiteSpace: 'nowrap' }}>% Chance mín.:</label>
+            <label style={{ fontSize: 12, color: 'var(--muted)', whiteSpace: 'nowrap' }}>Relevância mín.:</label>
             <select
               value={minScore}
               onChange={e => setMinScore(Number(e.target.value))}
@@ -261,6 +387,41 @@ export default function OffersTable() {
             {exporting ? 'Exportando…' : '↓ Exportar CSV'}
           </button>
 
+          {/* Export Feedback Excel */}
+          <button
+            onClick={handleExportFeedback}
+            disabled={exportingFeedback || loading}
+            title="Exportar planilha para preenchimento de feedback"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              padding: '4px 14px', fontSize: 12, fontWeight: 600, borderRadius: 6,
+              border: '1px solid var(--border)',
+              background: exportingFeedback ? 'var(--surface)' : 'var(--green)',
+              color: exportingFeedback ? 'var(--muted)' : '#fff',
+              cursor: exportingFeedback || loading ? 'not-allowed' : 'pointer',
+              opacity: exportingFeedback || loading ? 0.7 : 1,
+              whiteSpace: 'nowrap', transition: 'opacity 0.2s',
+            }}
+          >
+            {exportingFeedback ? 'Exportando...' : 'Feedback Excel'}
+          </button>
+
+          {/* Import Feedback */}
+          <button
+            onClick={() => setShowFeedbackUpload(true)}
+            title="Importar planilha de feedback preenchida"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              padding: '4px 14px', fontSize: 12, fontWeight: 600, borderRadius: 6,
+              border: '1px solid var(--border)',
+              background: 'var(--amber)',
+              color: '#fff', cursor: 'pointer',
+              whiteSpace: 'nowrap', transition: 'opacity 0.2s',
+            }}
+          >
+            Importar Feedback
+          </button>
+
         </div>
       </div>
 
@@ -273,28 +434,26 @@ export default function OffersTable() {
         <div className="empty" style={{ height: 160 }}>Nenhuma oferta com os filtros selecionados.</div>
       ) : (
         <div style={{ overflowX: 'auto' }}>
-          <table className="rank-table">
+          <table className="rank-table" style={{ tableLayout: 'auto', width: '100%' }}>
             <thead>
               <tr>
                 <th style={{ width: 32 }}>#</th>
-                <th>Cliente</th>
-                <th>Produto</th>
+                <th style={{ minWidth: 180 }}>Cliente</th>
+                <th style={{ minWidth: 200 }}>Produto</th>
                 <th
+                  onClick={() => toggleSort('price')}
+                  style={{ textAlign: 'right', cursor: 'pointer', userSelect: 'none' }}
+                  title="Clique para ordenar por valor"
+                >Valor{sortArrow('price')}</th>
+                <th
+                  onClick={() => toggleSort('score')}
                   style={{ textAlign: 'center', cursor: 'pointer', userSelect: 'none' }}
-                  onClick={() => {
-                    setSortDir(prev => prev === null ? 'desc' : prev === 'desc' ? 'asc' : null)
-                    setPage(1)
-                  }}
                   title="Clique para ordenar por probabilidade"
-                >
-                  % Chance{' '}
-                  <span style={{ fontSize: 10, opacity: sortDir ? 1 : 0.3 }}>
-                    {sortDir === 'asc' ? '\u2191' : sortDir === 'desc' ? '\u2193' : '\u2195'}
-                  </span>
-                </th>
+                >% Chance{sortArrow('score')}</th>
                 <th>Última Compra</th>
                 <th>Contato</th>
                 <th>Modelo</th>
+                <th style={{ textAlign: 'center' }}>Status</th>
                 <th style={{ textAlign: 'center' }}>WhatsApp</th>
               </tr>
             </thead>
@@ -308,11 +467,17 @@ export default function OffersTable() {
                     </span>
                   </td>
 
-                  {/* Cliente — clicável para abrir timeline de compras */}
-                  <td style={{ maxWidth: 200 }}>
+                  {/* Cliente — clicavel para abrir timeline de compras */}
+                  <td style={{
+                    minWidth:     180,
+                    overflow:     'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace:   'nowrap',
+                    paddingRight: 12,
+                  }}>
                     <button
                       onClick={() => setSelectedCustomer({ id: row.customer_id, name: row.customer_name })}
-                      title="Ver histórico de compras"
+                      title={row.customer_name || '—'}
                       style={{
                         background:      'none',
                         border:          'none',
@@ -325,16 +490,28 @@ export default function OffersTable() {
                         textDecorationStyle: 'dotted',
                         textUnderlineOffset: '3px',
                         textAlign:       'left',
+                        maxWidth:        '100%',
+                        overflow:        'hidden',
+                        textOverflow:    'ellipsis',
+                        whiteSpace:      'nowrap',
+                        display:         'block',
                       }}
                     >
                       {row.customer_name || '—'}
                     </button>
                   </td>
 
-                  {/* Produto */}
-                  <td style={{ maxWidth: 240 }}>
-                    <span style={{ fontSize: 12 }}>
-                      {row.product_name || `Produto #${row.product_id}`}
+                  {/* Produto — hover mostra tooltip com detalhes */}
+                  <td style={{ minWidth: 200, paddingRight: 12 }}>
+                    <ProductTooltip row={row} />
+                  </td>
+
+                  {/* Valor unitário médio */}
+                  <td style={{ textAlign: 'right' }}>
+                    <span className="mono" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                      {(row.avg_unit_price ?? 0) > 0
+                        ? row.avg_unit_price.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+                        : '—'}
                     </span>
                   </td>
 
@@ -358,8 +535,9 @@ export default function OffersTable() {
                   {/* Contato — celular preferencial, fallback para fixo */}
                   <td>
                     <span className="mono" style={{ fontSize: 12 }}>
-                      {maskPhone(row.contact)}
+                      {formatPhone(row.contact)}
                     </span>
+                    <PhoneTypeBadge type={row.phone_type} />
                   </td>
 
                   {/* Estratégia */}
@@ -367,6 +545,26 @@ export default function OffersTable() {
                     <span style={{ fontSize: 11, color: 'var(--muted)' }}>
                       {row.strategy === 'modelo_a_ranker' ? 'Modelo A' : 'Modelo B'}
                     </span>
+                  </td>
+
+                  {/* Status de conversao */}
+                  <td style={{ textAlign: 'center' }}>
+                    {row.converted === true ? (
+                      <span style={{
+                        display: 'inline-block', padding: '2px 8px', borderRadius: 999,
+                        fontSize: 11, fontWeight: 600, background: '#dcfce7', color: '#166534',
+                      }}>Convertido</span>
+                    ) : row.converted === false ? (
+                      <span style={{
+                        display: 'inline-block', padding: '2px 8px', borderRadius: 999,
+                        fontSize: 11, fontWeight: 600, background: '#fee2e2', color: '#991b1b',
+                      }}>Nao convertido</span>
+                    ) : (
+                      <span style={{
+                        display: 'inline-block', padding: '2px 8px', borderRadius: 999,
+                        fontSize: 11, fontWeight: 600, background: '#fef3c7', color: '#92400e',
+                      }}>Pendente</span>
+                    )}
                   </td>
 
                   {/* Botão WhatsApp (sem ação — Phase 1) */}
@@ -402,7 +600,7 @@ export default function OffersTable() {
       )}
 
       {/* ── Paginação + Rodapé ────────────────────────────────────────────── */}
-      {!loading && filtered.length > 0 && (
+      {!loading && sorted.length > 0 && (
         <div style={{
           display:       'flex',
           alignItems:    'center',
@@ -465,7 +663,7 @@ export default function OffersTable() {
 
           {/* Resumo */}
           <span style={{ fontSize: 11, color: 'var(--muted)' }}>
-            {((safePage - 1) * PAGE_SIZE + 1).toLocaleString('pt-BR')}–{Math.min(safePage * PAGE_SIZE, filtered.length).toLocaleString('pt-BR')} de {filtered.length.toLocaleString('pt-BR')} ofertas filtradas · {data.length.toLocaleString('pt-BR')} total
+            {((safePage - 1) * PAGE_SIZE + 1).toLocaleString('pt-BR')}–{Math.min(safePage * PAGE_SIZE, sorted.length).toLocaleString('pt-BR')} de {sorted.length.toLocaleString('pt-BR')} ofertas filtradas · {data.length.toLocaleString('pt-BR')} total
           </span>
 
         </div>
@@ -479,6 +677,23 @@ export default function OffersTable() {
           onClose={() => setSelectedCustomer(null)}
         />
       )}
+
+      {showFeedbackUpload && (
+        <FeedbackUpload
+          onClose={() => setShowFeedbackUpload(false)}
+          onSuccess={() => {
+            // Reload offers to show updated status
+            setLoading(true)
+            const params = new URLSearchParams({ limit: 500 })
+            if (strategy) params.set('strategy', strategy)
+            apiFetch(`/api/recommendations/offers?${params}`)
+              .then(r => r.json())
+              .then(d => { setData(d); setLoading(false) })
+              .catch(() => setLoading(false))
+          }}
+        />
+      )}
     </div>
+    </>
   )
 }

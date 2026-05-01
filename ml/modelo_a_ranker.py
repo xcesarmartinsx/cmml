@@ -113,15 +113,22 @@ HISTORY_WINDOW_DAYS = 1095  # ~3 anos; ajustável via --history-days na CLI
 # Número de candidatos por cliente (top produtos mais populares ainda não comprados)
 N_CANDIDATES = 500
 
+# Produtos a excluir — não são produtos reais de venda (serviços/taxas).
+PRODUCT_BLACKLIST = [
+    'BORDADO',
+    'TAXA DE ENTREGA',
+    'TAXA ENTREGA',
+]
+
 # Hiperparâmetros do LightGBM — ponto de partida conservador
 # Para otimização, use Optuna (ver seção de tuning abaixo)
 LGBM_PARAMS = {
     "objective":        "binary",        # problema de classificação binária
-    "metric":           "auc",           # métrica de early stopping
+    "metric":           "binary_logloss", # logloss melhora calibração após AUC saturar
     "verbosity":        -1,              # silencioso (logs pelo nosso logger)
     "learning_rate":    0.05,            # baixo → mais rounds, mais estável
-    "num_leaves":       63,              # controla capacidade do modelo
-    "min_child_samples": 50,             # regularização → evita overfitting em grupos pequenos
+    "num_leaves":       31,              # reduz complexidade por árvore, força mais rounds
+    "min_child_samples": 200,            # estabiliza valores das folhas em dataset grande
     "feature_fraction": 0.8,            # bagging de features (regularização)
     "bagging_fraction": 0.8,            # bagging de amostras
     "bagging_freq":     5,              # frequência do bagging
@@ -132,7 +139,7 @@ LGBM_PARAMS = {
 }
 
 LGBM_NUM_ROUNDS   = 1000   # máximo de árvores (early stopping vai cortar)
-LGBM_EARLY_STOP   = 50    # para se AUC não melhorar em 50 rounds
+LGBM_EARLY_STOP   = 50    # para se logloss não melhorar em 50 rounds
 
 
 # ===========================================================================
@@ -180,6 +187,7 @@ def load_order_history(pg, history_days: int = HISTORY_WINDOW_DAYS) -> pd.DataFr
           AND sc.name NOT ILIKE '%CONSUMIDOR%' -- exclui CONSUMIDOR FINAL
           AND sc.name NOT ILIKE '%GENERICO%'   -- exclui clientes genéricos
           AND sc.name NOT ILIKE '%AVULSO%'     -- exclui vendas avulsas
+          AND p.description NOT IN ({','.join(f"'{p}'" for p in PRODUCT_BLACKLIST)})
         ORDER BY oi.sale_date ASC
     """
 
@@ -404,12 +412,35 @@ def build_product_features(df_train: pd.DataFrame, reference_date: pd.Timestamp)
             .mean()
             .rename("product_avg_repurchase_days")
         )
+        # Lifecycle reliability features:
+        # sample_size = number of repurchase intervals (more = more confident)
+        product_repurchase_sample_size = (
+            intervals_df.groupby("product_id")["days_interval"]
+            .count()
+            .rename("product_repurchase_sample_size")
+        )
+        # distinct customers contributing repurchase data
+        product_repurchase_distinct_customers = (
+            intervals_df.groupby("product_id")["customer_id"]
+            .nunique()
+            .rename("product_repurchase_distinct_customers")
+        )
+        # coefficient of variation: std/mean (0 = consistent, >1 = noisy lifecycle)
+        product_repurchase_cv = (
+            intervals_df.groupby("product_id")["days_interval"]
+            .agg(lambda x: x.std() / x.mean() if x.mean() > 0 and len(x) > 1 else 0.0)
+            .rename("product_repurchase_cv")
+        )
     else:
         product_avg_repurchase_days = pd.Series(dtype=float, name="product_avg_repurchase_days")
+        product_repurchase_sample_size = pd.Series(dtype=float, name="product_repurchase_sample_size")
+        product_repurchase_distinct_customers = pd.Series(dtype=float, name="product_repurchase_distinct_customers")
+        product_repurchase_cv = pd.Series(dtype=float, name="product_repurchase_cv")
 
     product_features = pd.concat(
         [popularity_30d, volume_90d, revenue_90d, total_buyers, product_repeat_rate,
-         product_avg_repurchase_days],
+         product_avg_repurchase_days, product_repurchase_sample_size,
+         product_repurchase_distinct_customers, product_repurchase_cv],
         axis=1,
     ).fillna(0)
 
@@ -505,32 +536,36 @@ def build_training_dataset(
     df_train: pd.DataFrame,
     df_label: pd.DataFrame,
     n_candidates: int = N_CANDIDATES,
+    include_non_purchasers: bool = True,
+    non_purchaser_frac: float = 0.30,
 ) -> Tuple[pd.DataFrame, np.ndarray]:
     """
     Monta o dataset de treino completo com features e labels.
 
-    Estratégia de amostragem negativa:
-    Para cada compra REAL no df_label (positivos = label 1), geramos
-    `n_neg_ratio` exemplos negativos aleatórios de produtos que o cliente
-    NÃO comprou. Isso é necessário porque o dataset real é muito desbalanceado
-    (clientes compram uma fração mínima do catálogo).
+    Estratégia de amostragem negativa (RECOMPRA-AWARE):
+    Para cada cliente no período de label:
+      - Positivos (label=1): produtos que o cliente comprou no df_label
+      - Negativos (label=0): produtos que o cliente JA COMPROU no df_train
+        MAS que NAO comprou no df_label.
+
+    Isso forca o modelo a aprender a diferenciar ENTRE produtos ja comprados:
+    quais vale a pena recomendar agora? Features como lifecycle_ratio,
+    days_since_last_product_purchase e avg_qty_per_purchase guiam essa decisao.
 
     Parâmetros
     ----------
     df_train    : compras do período de treino (features)
     df_label    : compras do período de validação/teste (labels)
-    n_candidates: candidatos negativos por cliente
+    n_candidates: (legado, ignorado na nova estrategia)
 
     Retorna
     -------
     (X, y) onde X é o DataFrame de features e y é o array de labels
     """
     reference_date = df_train["sale_date"].max()
-    all_products   = df_train["product_id"].unique()
 
-    LOG.info("Montando dataset de treino...")
+    LOG.info("Montando dataset de treino (recompra-aware)...")
     LOG.info(f"  Período de referência (features): até {reference_date.date()}")
-    LOG.info(f"  Candidatos negativos por cliente: {n_candidates}")
 
     # --- Labels positivos (reais) ---
     positives = (
@@ -540,27 +575,53 @@ def build_training_dataset(
     )
     positives["label"] = 1
 
-    # --- Labels negativos (amostrados) ---
-    # Para cada cliente, amostrar produtos que ele NÃO comprou no período de label
-    customers = positives["customer_id"].unique()
+    # --- Labels negativos: produtos comprados ANTES mas NAO no periodo de label ---
+    customers_with_purchase = set(positives["customer_id"].tolist())
     rng = np.random.default_rng(seed=42)
+
+    if include_non_purchasers:
+        customers_without_purchase = [
+            cid for cid in df_train["customer_id"].unique()
+            if cid not in customers_with_purchase
+        ]
+        sample_size = max(1, int(len(customers_without_purchase) * non_purchaser_frac))
+        customers_no_purchase_sampled = rng.choice(
+            customers_without_purchase, size=min(sample_size, len(customers_without_purchase)), replace=False
+        )
+        LOG.info(
+            f"  Clientes com compra no label: {len(customers_with_purchase):,} | "
+            f"sem compra (amostrados {non_purchaser_frac:.0%}): {len(customers_no_purchase_sampled):,}"
+        )
+        customers = np.concatenate([positives["customer_id"].unique(), customers_no_purchase_sampled])
+    else:
+        LOG.info(
+            f"  Clientes com compra no label: {len(customers_with_purchase):,} | "
+            f"sem compra: excluídos (include_non_purchasers=False)"
+        )
+        customers = positives["customer_id"].unique()
     negatives_list = []
 
     for cid in customers:
-        # Produtos que esse cliente comprou (qualquer período) — excluir dos negativos
-        bought = set(df_train[df_train["customer_id"] == cid]["product_id"].tolist())
-        bought |= set(positives[positives["customer_id"] == cid]["product_id"].tolist())
+        # Produtos que o cliente comprou no período de TREINO (historico)
+        ever_bought_in_train = set(
+            df_train[df_train["customer_id"] == cid]["product_id"].tolist()
+        )
 
-        # Candidatos negativos: produtos populares que o cliente não comprou
-        candidates = [p for p in all_products if p not in bought]
+        # Produtos que o cliente comprou no período de LABEL (positivos)
+        bought_in_label = set(
+            positives[positives["customer_id"] == cid]["product_id"].tolist()
+        )
 
-        if not candidates:
+        # Negativos = produtos comprados ANTES mas NAO no periodo de label
+        # Estes sao os candidatos que o modelo precisa aprender a discriminar:
+        # "comprou antes, mas nao vai comprar agora"
+        neg_candidates = list(ever_bought_in_train - bought_in_label)
+
+        if not neg_candidates:
             continue
 
-        n_sample = min(n_candidates, len(candidates))
-        sampled = rng.choice(candidates, size=n_sample, replace=False)
         negatives_list.append(
-            pd.DataFrame({"customer_id": cid, "product_id": sampled, "label": 0})
+            pd.DataFrame({"customer_id": cid, "product_id": neg_candidates, "label": 0})
         )
 
     negatives = pd.concat(negatives_list, ignore_index=True) if negatives_list else pd.DataFrame()
@@ -611,6 +672,40 @@ def build_training_dataset(
         (dataset["lifecycle_ratio"] < 0.5).astype(float),
         0.0,
     )
+
+    # ── Feedback features: historical offer outcomes ──────────────────────
+    # Anti-leakage: only use offers generated BEFORE reference_date
+    try:
+        feedback_query = """
+            SELECT o.customer_id, o.product_id,
+                   1 AS offer_was_sent,
+                   COALESCE(bool_or(oo.converted), FALSE) AS offer_converted,
+                   MAX(o.score) AS offer_score_prev
+            FROM reco.offers o
+            LEFT JOIN reco.offer_outcomes oo ON oo.offer_id = o.offer_id
+            WHERE o.generated_at < %(reference_date)s
+            GROUP BY o.customer_id, o.product_id
+        """
+        import psycopg2
+        feedback_pg = get_pg_conn()
+        feedback_df = pd.read_sql(feedback_query, feedback_pg, params={"reference_date": reference_date})
+        feedback_pg.close()
+
+        dataset = dataset.merge(
+            feedback_df,
+            on=["customer_id", "product_id"],
+            how="left",
+        )
+        dataset["offer_was_sent"] = dataset["offer_was_sent"].fillna(0).astype(int)
+        dataset["offer_converted"] = dataset["offer_converted"].fillna(False).astype(int)
+        dataset["offer_score_prev"] = dataset["offer_score_prev"].fillna(0).astype(float)
+        LOG.info(f"Feedback features: {dataset['offer_was_sent'].sum():,} pairs with prior offers, "
+                 f"{dataset['offer_converted'].sum():,} converted")
+    except Exception as exc:
+        LOG.warning(f"Could not load feedback features (table may not exist yet): {exc}")
+        dataset["offer_was_sent"] = 0
+        dataset["offer_converted"] = 0
+        dataset["offer_score_prev"] = 0.0
 
     # Separa features (X) e labels (y)
     y = dataset["label"].values.astype(int)
@@ -667,8 +762,9 @@ def train_lightgbm(
     # sqrt(175) ≈ 13 distribui o aprendizado por muitos rounds preservando recall.
     neg_count = (y_train == 0).sum()
     pos_count = (y_train == 1).sum()
-    scale_pos = (neg_count / max(pos_count, 1)) ** 0.5
-    LOG.info(f"scale_pos_weight automático: {scale_pos:.1f} (neg={neg_count:,}, pos={pos_count:,})")
+    scale_pos_raw = (neg_count / max(pos_count, 1)) ** 0.5
+    scale_pos = min(scale_pos_raw, 10.0)
+    LOG.info(f"scale_pos_weight automático: {scale_pos:.1f} (raw={scale_pos_raw:.1f}, cap=10.0, neg={neg_count:,}, pos={pos_count:,})")
 
     params = {**LGBM_PARAMS, "scale_pos_weight": scale_pos}
 
@@ -680,7 +776,7 @@ def train_lightgbm(
 
     callbacks = [
         lgb.early_stopping(stopping_rounds=LGBM_EARLY_STOP, verbose=False),
-        lgb.log_evaluation(period=50),  # loga AUC a cada 50 rounds
+        lgb.log_evaluation(period=50),  # loga métrica a cada 50 rounds
     ]
 
     model = lgb.train(
@@ -731,23 +827,27 @@ def generate_recommendations(
     customer_ids: Optional[List[int]] = None,
     top_n: int = 10,
     n_candidates: int = N_CANDIDATES,
+    only_ever_bought: bool = True,
 ) -> pd.DataFrame:
     """
     Gera recomendações para os clientes usando o modelo treinado.
 
     Para cada cliente:
-    1. Identifica produtos candidatos (populares + não comprados recentemente)
-    2. Constrói features para cada par (cliente × produto_candidato)
-    3. Prediz a probabilidade de compra
-    4. Retorna os top_n com maior probabilidade
+    1. Força inclusão de todos os produtos já comprados (exceto últimos 30d)
+    2. Preenche até n_candidates com produtos aleatórios
+    3. Constrói features para cada par (cliente × produto_candidato)
+    4. Prediz probabilidade de compra (raw LightGBM scores, sem normalização)
+    5. Seleciona top-N por score
 
     Parâmetros
     ----------
-    model        : modelo LightGBM treinado
-    df_history   : histórico de compras (para features e exclusão de comprados)
-    customer_ids : lista de clientes (None = todos)
-    top_n        : número de recomendações por cliente
-    n_candidates : candidatos a avaliar por cliente
+    model            : modelo LightGBM treinado
+    df_history       : histórico de compras (para features e exclusão de comprados)
+    customer_ids     : lista de clientes (None = todos)
+    top_n            : número de recomendações por cliente
+    n_candidates     : candidatos a avaliar por cliente (bought-before + aleatórios)
+    only_ever_bought : se True, apenas produtos ja comprados pelo cliente sao candidatos
+                       (exclui random fill de nunca-comprados, foco em recompra)
 
     Retorna
     -------
@@ -769,8 +869,9 @@ def generate_recommendations(
     rng = np.random.default_rng(seed=42)
 
     for cid in customer_ids:
-        # Produtos que o cliente comprou nos últimos 30 dias (janela de recompra)
-        recent_window = reference_date - pd.Timedelta(days=30)
+        # Produtos que o cliente comprou nos ultimos 7 dias (janela curta de exclusao;
+        # o filtro de lifecycle em generate_offers.py cuida do resto)
+        recent_window = reference_date - pd.Timedelta(days=7)
         recently_bought = set(
             df_history[
                 (df_history["customer_id"] == cid) &
@@ -778,19 +879,35 @@ def generate_recommendations(
             ]["product_id"].tolist()
         )
 
-        # Candidatos: produtos populares que o cliente não comprou recentemente
-        candidates = [p for p in all_products if p not in recently_bought]
-        if not candidates:
+        ever_bought = set(
+            df_history[df_history["customer_id"] == cid]["product_id"].unique()
+        ) - recently_bought
+
+        if only_ever_bought:
+            # Modo recompra: apenas produtos ja comprados (exceto ultimos 7d)
+            forced = list(ever_bought)
+            if not forced:
+                LOG.debug(f"Cliente {cid}: sem produtos ever-bought disponiveis (skip)")
+                continue
+            candidates = np.array(forced)
+        else:
+            # Modo original: ever-bought + random fill de nunca-comprados
+            all_candidates = [p for p in all_products if p not in recently_bought]
+            forced = [p for p in all_candidates if p in ever_bought]
+            remaining = [p for p in all_candidates if p not in ever_bought]
+
+            n_random = min(n_candidates - len(forced), len(remaining))
+            random_candidates = list(rng.choice(remaining, size=n_random, replace=False)) if n_random > 0 else []
+
+            candidates = np.array(forced + random_candidates)
+        if len(candidates) == 0:
             LOG.debug(f"Cliente {cid}: sem candidatos disponíveis")
             continue
-
-        n_sample = min(n_candidates, len(candidates))
-        sampled_candidates = rng.choice(candidates, size=n_sample, replace=False)
 
         # Monta features para os candidatos
         candidate_pairs = pd.DataFrame({
             "customer_id": cid,
-            "product_id":  sampled_candidates,
+            "product_id":  candidates,
         })
 
         interaction = build_interaction_features(
@@ -824,24 +941,39 @@ def generate_recommendations(
 
         # Garante que as colunas estão na mesma ordem do treino
         feature_cols = model.feature_name()
+        # Adiciona colunas de feedback com valor 0 se não existirem
+        for col in feature_cols:
+            if col not in X_inf.columns:
+                X_inf[col] = 0.0
         X_pred = X_inf[feature_cols].fillna(0)
 
         # Predição de probabilidade
         scores = model.predict(X_pred)
 
-        # Ordena por score e pega os top_n
+        # Raw LightGBM probabilities — bought-before já estão no pool,
+        # modelo decide ranking naturalmente (features de interação ricas).
+        # Top-N direto por score, sem separação de slots.
         top_idx = np.argsort(scores)[::-1][:top_n]
 
         for rank, idx in enumerate(top_idx, start=1):
             results.append({
                 "customer_id": cid,
-                "product_id":  sampled_candidates[idx],
+                "product_id":  candidates[idx],
                 "score":       float(scores[idx]),
                 "rank":        rank,
                 "strategy":    "modelo_a_ranker",
             })
 
     reco_df = pd.DataFrame(results)
+
+    if len(reco_df) > 0:
+        LOG.info(
+            f"Scores (raw LightGBM probabilities): "
+            f"min={reco_df['score'].min():.4f}, "
+            f"median={reco_df['score'].median():.4f}, "
+            f"max={reco_df['score'].max():.4f}"
+        )
+
     LOG.info(f"Recomendações geradas: {len(reco_df):,} sugestões para {reco_df['customer_id'].nunique():,} clientes")
     return reco_df
 
@@ -942,7 +1074,8 @@ def run_pipeline(
         df_es_hist   = df_train[df_train["sale_date"] <= es_cutoff]
         df_es_labels = df_train[df_train["sale_date"] >  es_cutoff]
         LOG.info(f"Montando dataset de early stopping (últimos 30d do treino: {df_es_labels['sale_date'].min().date()} → {df_es_labels['sale_date'].max().date()})...")
-        X_es, y_es, _ = build_training_dataset(df_es_hist, df_es_labels)
+        X_es, y_es, _ = build_training_dataset(df_es_hist, df_es_labels,
+                                                include_non_purchasers=False)
 
         # Dataset de avaliação final: features = treino + val, labels = teste.
         # Usado APENAS para métricas finais, nunca para early stopping.
@@ -972,7 +1105,7 @@ def run_pipeline(
         eval_results = evaluate_binary_classifier(y_eval, y_proba)
 
         # Threshold ótimo para maximizar F1 (balanceamento precision/recall)
-        best_threshold, best_f1 = find_optimal_threshold(y_eval, y_proba, metric="f1")
+        best_threshold, best_f1 = find_optimal_threshold(y_eval, y_proba, metric="f1-score")
 
         # ── 6. Avaliação de ranking (Precision@K, Recall@K, etc.) ───────────
         # Agrupa previsões por cliente para calcular métricas de ranking
@@ -1003,7 +1136,10 @@ def run_pipeline(
             f"auc_roc={eval_results.get('auc_roc', 'N/A'):.4f} | "
             f"n_rounds={getattr(model, 'best_iteration', 'N/A')}"
         )
-        save_metrics_to_db(pg, df_metrics, strategy="modelo_a_ranker", notes=notes)
+        save_metrics_to_db(
+            pg, df_metrics, strategy="modelo_a_ranker", notes=notes,
+            auc_roc=eval_results.get("auc_roc"),
+        )
 
         LOG.info("Pipeline do Modelo A concluído com sucesso.")
 

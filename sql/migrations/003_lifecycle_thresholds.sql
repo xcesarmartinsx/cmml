@@ -1,21 +1,18 @@
 -- =============================================================================
--- sql/ddl/04_product_lifecycle.sql
--- Materialized view com metricas de ciclo de vida por produto.
+-- Migration 003: Rebuild product_lifecycle with stricter thresholds
 --
--- Calcula o intervalo medio e mediano entre recompras do mesmo produto
--- pelo mesmo cliente. Usado pelo modelo ML para penalizar recomendacoes
--- de produtos de longa vida util quando o cliente comprou recentemente.
+-- Changes:
+--   - Minimum sample_size: 2 -> 5
+--   - Minimum distinct_customers: 1 -> 3
+--   - New columns: cv_days_between, reliability_tier
 --
--- Execucao:
---   psql -h $PG_HOST -p $PG_PORT -U $PG_USER -d $PG_DB -f sql/ddl/04_product_lifecycle.sql
---
--- Refresh (apos novo ETL):
---   REFRESH MATERIALIZED VIEW CONCURRENTLY reco.product_lifecycle;
+-- Idempotent: safe to run multiple times.
 -- =============================================================================
 
--- Materialized view para performance: a query com window functions e pesada.
--- CONCURRENTLY requer um unique index, adicionado abaixo.
-CREATE MATERIALIZED VIEW IF NOT EXISTS reco.product_lifecycle AS
+-- Drop and recreate (materialized views don't support ALTER)
+DROP MATERIALIZED VIEW IF EXISTS reco.product_lifecycle CASCADE;
+
+CREATE MATERIALIZED VIEW reco.product_lifecycle AS
 WITH purchase_intervals AS (
     SELECT
         oi.product_id,
@@ -84,14 +81,15 @@ FROM product_stats
 WHERE sample_size >= 5
   AND distinct_customers >= 3;
 
--- Unique index necessario para REFRESH MATERIALIZED VIEW CONCURRENTLY
+-- Recreate indexes
 CREATE UNIQUE INDEX IF NOT EXISTS idx_product_lifecycle_product_id
     ON reco.product_lifecycle (product_id);
 
--- Indice para filtrar por tier
 CREATE INDEX IF NOT EXISTS idx_product_lifecycle_tier
     ON reco.product_lifecycle (lifecycle_tier);
 
--- Indice para filtrar por reliability
 CREATE INDEX IF NOT EXISTS idx_product_lifecycle_reliability
     ON reco.product_lifecycle (reliability_tier);
+
+-- Add score_raw column to reco.offers (stores pre-normalization probability)
+ALTER TABLE reco.offers ADD COLUMN IF NOT EXISTS score_raw NUMERIC(6,4);

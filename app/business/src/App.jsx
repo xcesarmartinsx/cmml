@@ -19,7 +19,9 @@ import CustomerShareChart from './components/CustomerShareChart.jsx'
 import OffersPage        from './components/OffersPage.jsx'
 import LoginPage         from './components/LoginPage.jsx'
 import PrivateRoute      from './components/PrivateRoute.jsx'
-import { logout, apiFetch } from './api.js'
+import { logout, apiFetch, getUserRole, getToken } from './api.js'
+import UsersPage from './components/UsersPage.jsx'
+import ProductLifecyclePage from './components/ProductLifecyclePage.jsx'
 import './index.css'
 
 // ── Formatadores ──────────────────────────────────────────────────────────────
@@ -69,6 +71,15 @@ function IconOffers({ active }) {
   )
 }
 
+function IconLifecycle({ active }) {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={active ? 2.2 : 1.8} strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <polyline points="12 6 12 12 16 14" />
+    </svg>
+  )
+}
+
 // ── Componente principal (roteamento) ─────────────────────────────────────────
 export default function App() {
   return (
@@ -82,7 +93,8 @@ export default function App() {
 // ── Dashboard (conteúdo protegido) ───────────────────────────────────────────
 function Dashboard() {
   // ── Navegação ───────────────────────────────────────────────────────────────
-  const [view, setView] = useState('dashboard')  // 'dashboard' | 'offers'
+  const [view, setView] = useState('dashboard')  // 'dashboard' | 'offers' | 'lifecycle' | 'users'
+  const isAdmin = getUserRole() === 'admin'
 
   // ── Estado do Dashboard ─────────────────────────────────────────────────────
   const [meta,       setMeta]       = useState(null)
@@ -185,12 +197,18 @@ function Dashboard() {
           <div className="header-left">
             <div className="header-brand">
               <h1>
-                <span className="dot" style={{ background: view === 'offers' ? 'var(--purple)' : 'var(--green)' }} />
-                {view === 'dashboard' ? 'Visão 360° Empresarial' : 'Ofertas & Recomendações'}
+                <span className="dot" style={{ background: view === 'offers' ? 'var(--purple)' : view === 'lifecycle' ? 'var(--amber)' : 'var(--green)' }} />
+                {view === 'dashboard'
+                  ? 'Visao 360 Empresarial'
+                  : view === 'lifecycle'
+                  ? 'Ciclo de Vida dos Produtos'
+                  : 'Ofertas & Recomendacoes'}
               </h1>
               <p>{view === 'dashboard'
-                ? 'Faturamento · Produtos · Clientes · Sazonalidade'
-                : 'Modelos ML · Ciclo de Vida · Funil de Oportunidades'
+                ? 'Faturamento - Produtos - Clientes - Sazonalidade'
+                : view === 'lifecycle'
+                ? 'Intervalos de recompra - Tiers - Validacao de ofertas ML'
+                : 'Modelos ML - Ciclo de Vida - Funil de Oportunidades'
               }</p>
             </div>
 
@@ -210,11 +228,36 @@ function Dashboard() {
                 <IconOffers active={view === 'offers'} />
                 Ofertas
               </button>
+              <button
+                className={`nav-tab ${view === 'lifecycle' ? 'active' : ''}`}
+                onClick={() => setView('lifecycle')}
+              >
+                <IconLifecycle active={view === 'lifecycle'} />
+                Ciclo de Vida
+              </button>
+              {isAdmin && (
+                <button
+                  className={`nav-tab ${view === 'users' ? 'active' : ''}`}
+                  onClick={() => setView('users')}
+                >
+                  Usuarios
+                </button>
+              )}
             </nav>
           </div>
 
           {/* ── Logout ── */}
           <button className="logout-btn" onClick={logout} title="Sair">Sair</button>
+          {isAdmin && (
+            <button
+              className="nav-tab offers"
+              style={{ marginLeft: 8 }}
+              title="Abrir Dashboard ML como administrador"
+              onClick={() => window.open(`http://localhost:3000/?token=${getToken()}`, '_blank')}
+            >
+              Dashboard ML
+            </button>
+          )}
 
           {/* ── Controles (apenas no Dashboard) ── */}
           {view === 'dashboard' && (
@@ -258,8 +301,13 @@ function Dashboard() {
 
       {/* ══ CONTEÚDO ════════════════════════════════════════════════════════ */}
 
-      {view === 'offers' ? (
-        // ── Página de Ofertas ───────────────────────────────────────────────
+      {view === 'users' ? (
+        <UsersPage />
+      ) : view === 'lifecycle' ? (
+        // ── Pagina de Ciclo de Vida ─────────────────────────────────────────
+        <ProductLifecyclePage />
+      ) : view === 'offers' ? (
+        // ── Pagina de Ofertas ───────────────────────────────────────────────
         <OffersPage />
       ) : (
         // ── Dashboard Empresarial ───────────────────────────────────────────

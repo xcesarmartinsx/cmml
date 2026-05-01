@@ -73,11 +73,14 @@ export default function ModelCard({ strategy, latestRunsByK }) {
             <span className="meta-value">{meta.historyDays} dias</span>
           </div>
         )}
-        {meta.aucRoc && (
+        {(metaRun?.auc_roc != null || meta.aucRoc) && (
           <div className="meta-item">
             <span className="meta-label">AUC-ROC</span>
             <span className="meta-value">
-              {parseFloat(meta.aucRoc).toFixed(4)}
+              {(metaRun?.auc_roc != null
+                ? metaRun.auc_roc
+                : parseFloat(meta.aucRoc)
+              ).toFixed(4)}
             </span>
           </div>
         )}

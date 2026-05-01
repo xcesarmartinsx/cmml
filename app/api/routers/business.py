@@ -122,15 +122,23 @@ def get_meta():
             WHERE status = 'success'
         """)
 
+        # Última data de venda registrada nos dados (para referência de backup incremental)
+        last_sale_date = _scalar(conn, """
+            SELECT MAX(sale_date)
+            FROM cur.order_items
+        """)
+
         return {
             # Intervalo de anos com dados
-            "year_min"     : years[0]["year_min"]    if years else None,
-            "year_max"     : years[0]["year_max"]    if years else None,
-            "days_loaded"  : years[0]["days_loaded"] if years else 0,
+            "year_min"       : years[0]["year_min"]    if years else None,
+            "year_max"       : years[0]["year_max"]    if years else None,
+            "days_loaded"    : years[0]["days_loaded"] if years else 0,
             # Contagem por mart (útil para verificar saúde)
-            "counts"       : counts,
+            "counts"         : counts,
             # ISO string da última atualização
-            "last_refresh" : last_refresh.isoformat() if last_refresh else None,
+            "last_refresh"   : last_refresh.isoformat() if last_refresh else None,
+            # ISO string da última data de venda (YYYY-MM-DD)
+            "last_sale_date" : last_sale_date.isoformat() if last_sale_date else None,
         }
     finally:
         # Garante fechamento da conexão mesmo em caso de exceção.

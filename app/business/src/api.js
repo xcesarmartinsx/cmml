@@ -46,3 +46,52 @@ export async function apiFetch(url, options = {}) {
 
   return response
 }
+
+/**
+ * Decodifica o payload do JWT (Base64, sem verificacao de assinatura).
+ * Usado apenas para UX client-side — o servidor sempre valida o token.
+ */
+function _decodeTokenPayload() {
+  const token = getToken()
+  if (!token) return null
+  try {
+    return JSON.parse(atob(token.split('.')[1]))
+  } catch {
+    return null
+  }
+}
+
+export function getUserRole() {
+  return _decodeTokenPayload()?.role || null
+}
+
+export function getUsername() {
+  return _decodeTokenPayload()?.sub || null
+}
+
+// ── Feedback endpoints ───────────────────────────────────────────────────────
+export async function fetchFeedbackSummary() {
+  const res = await apiFetch('/api/recommendations/feedback/summary')
+  return res.json()
+}
+
+export async function fetchFeedbackRuns() {
+  const res = await apiFetch('/api/recommendations/feedback/runs')
+  return res.json()
+}
+
+export async function triggerFeedbackRun(windowDays = 30) {
+  const params = new URLSearchParams({ window_days: windowDays })
+  const res = await apiFetch(`/api/recommendations/feedback/run?${params}`, { method: 'POST' })
+  return res.json()
+}
+
+export async function importFeedbackExcel(file) {
+  const formData = new FormData()
+  formData.append('file', file)
+  const res = await apiFetch('/api/recommendations/feedback/import', {
+    method: 'POST',
+    body: formData,
+  })
+  return res.json()
+}
